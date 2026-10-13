@@ -19,8 +19,8 @@ def parse_audio_file(filepath):
         message: Description of the result or error
 
     Includes:
-    - Decode 150-byte Universal Header with Precision Timing.
-    - Remove 16-byte Metadata Footers inserted every 64KB.
+    - Decode 128-byte File Header + 16-byte Block Header with Precision Timing.
+    - Remove 16-byte Metadata Trailers inserted every 64KB.
     - Remove "Startup Pop" (sensor initialization artifacts).
     - Return cleaned PCM data ready for .WAV export.
 
@@ -28,33 +28,33 @@ def parse_audio_file(filepath):
     ===========================================================================
     - Codec: Signed 16-bit PCM (Little Endian).
     - Sample Rate: 48,000 Hz.
-    - Structure: 150-byte Header, followed by audio data.
-    - Artifacts:
-        1. 64KB Page Footers: Every 65,536 bytes, a 16-byte metadata footer is inserted.
+    - Structure: 128-byte File Header + 16-byte Block Header, followed by audio data.
+    - Sync Markers:
+        1. 64KB Page Trailers: Every 65,536 bytes, a 16-byte metadata trailer is inserted.
            [Magic: 4B] [Time: 4B] [Date: 4B] [SubsecFrac: 2B] [Subsec: 2B] = 16 Bytes.
            Magic = 0xABCDEFEF (Little Endian).
         2. Startup Pop: The first ~17ms contain sensor initialization data (0x8000).
 
     AUDIO (.BIN) FILE STRUCTURE
     ===========================================================================
-    The file consists of a 150-byte Header followed by a sequence of 64KB
-    Audio Pages. Each page is terminated by a 16-byte Metadata Footer.
+    The file consists of a 128-byte File Header + 16-byte Block Header followed by a
+    sequence of 64KB Audio Pages. Each page is terminated by a 16-byte Sync Marker.
 
     GLOBAL LAYOUT:
     ---------------------------------------------------------
-    |  HEADER (0 - 150 Bytes)                               |
+    |  HEADER (0 - 144 Bytes)                               |
     |-------------------------------------------------------|
     |  AUDIO DATA PAGE 1 (~65,536 Bytes)                    |
     |-------------------------------------------------------|
-    |  METADATA FOOTER 1 (16 Bytes)                         |
+    |  SYNC MARKER 1 (16 Bytes)                             |
     |-------------------------------------------------------|
     |  AUDIO DATA PAGE 2 (~65,536 Bytes)                    |
     |-------------------------------------------------------|
     |  ... (Repeats until EOF)                              |
     ---------------------------------------------------------
 
-    1. HEADER DETAIL (Offsets 0 - 150)
-    --------------------------------------------------------------
+    1. HEADERS DETAIL (Offsets 0 - 143)
+    ---------------------128-Byte File Header---------------------
     | Offset  | Type     | Value (Hex)     | Description --------|
     |---------|----------|-----------------|---------------------|
     | 0-3     | UInt32   | C0 DA AF DE     | Magic Number        |
@@ -62,7 +62,8 @@ def parse_audio_file(filepath):
     | 8-14    | String   | ASCII "SPH0641" | Sensor Name         |
     | 28-31   | UInt32   | 80 BB 00 00     | Sample Rate = 48k   |
     | 60-127  |          | FF FF FF FF     | Padding             |
-    | 128-131 | UInt32   | 5A A5 5A A5     | Timestamp Sync Word |
+    |--------------------16-Byte Block Header--------------------|
+    | 128-131 | UInt32   | 5A A5 5A A5     | Timestamp Sync Numb |
     |--------------------| Description --------------------------|
     | 132     | BCD      | 07 (7am)        | Start Hour          |
     | 133     | BCD      | 20 (20min)      | Start Minute        |
@@ -75,7 +76,6 @@ def parse_audio_file(filepath):
     | 139     | BCD      | 25 (2025)       | Start Year          |
     | 140-141 | UInt16   | FF 03           | Subsecond Resolution|
     | 142-143 | UInt16   | CA 03           | Start Subsec Value  |
-    | 149     | UInt8    | 00 80 00 80     | Mic wakeup          |
     --------------------------------------------------------------
 
     2. AUDIO PAYLOAD (Signed 16-bit PCM, Little Endian)
@@ -87,11 +87,11 @@ def parse_audio_file(filepath):
     | 1696+   | (Var)       | (Var)       | VALID AUDIO     |
     ---------------------------------------------------------
 
-    3. BLOCK ARTIFACT (Inserted every ~64KB)
+    3. SYNC MARKER (Inserted every ~64KB)
     ---------------------------------------------------------
     | Rel Byte| Value (Hex) | Description                   |
     |---------|-------------|-------------------------------|
-    | 0-3     | EF EF CD AB | Footer Magic (Marker)         |
+    | 0-3     | EF EF CD AB | Magic Number                  |
     | 4-7     | HH MM SS XX | Time BCD (7 = Pad)            |
     | 8-11    | XX MM DD YY | Date BCD (8 = Pad)            |
     | 12-13   | FF 03       | 03FF => 1023  (Max Tick)      |
@@ -100,19 +100,19 @@ def parse_audio_file(filepath):
     """
 
     # --- CONSTANTS ---
-    # Standard Vesper Header is 150 bytes (Universally confirmed)
-    HEADER_SIZE = 150
+    # File Header (128) + Block Header (16) = 144 Bytes
+    HEADER_SIZE = 144
 
-    # Artifact Definition (64KB Page Footer)
-    FOOTER_MAGIC = b'\xEF\xEF\xCD\xAB' # 0xABCDEFEF (Little Endian)
-    FOOTER_LEN = 16
+    # Artifact Definition (64KB Page Trailer)
+    TRAILER_MAGIC = b'\xEF\xEF\xCD\xAB' # 0xABCDEFEF (Little Endian)
+    TRAILER_LEN = 16
 
     if not os.path.exists(filepath):
-        # Return format: Status, Msg, Meta, AudioData, FooterTimestamps
+        # Return format: Status, Msg, Meta, AudioData, TrailerTimestamps
         return "FAIL", "File not found", None, None, []
 
     try:
-        # --- PART 1: HEADER PARSING & PRECISION TIME ---
+        # --- 1. HEADER PARSING & PRECISION TIME ---
         # Decode standard metadata (IDs, SampleRate, Coarse Time)
         meta = decode_binary_header(filepath, header_size=HEADER_SIZE)
 
@@ -124,7 +124,7 @@ def parse_audio_file(filepath):
         meta['Start_Time'] = get_precise_start_time(filepath, meta, sensor_type="AUD")
         meta['Start_Time_Str'] = meta['Start_Time'].strftime('%Y-%m-%d %H:%M:%S.%f')
 
-        # --- PART 2: READ RAW FILE ---
+        # --- 2. READ RAW FILE ---
         with open(filepath, 'rb') as f:
             f.seek(HEADER_SIZE)
             raw_bytes = f.read()
@@ -135,26 +135,26 @@ def parse_audio_file(filepath):
         clean_byte_stream = bytearray()
         cursor = 0
         file_len = len(raw_bytes)
-        timestamps = [] # Store timestamps found in footers for debugging/validation
+        timestamps = [] # Store timestamps found in trailers for debugging/validation
 
-        # --- PART 3: ARTIFACT REMOVAL LOOP ---
+        # --- 3. ARTIFACT REMOVAL LOOP ---
         while cursor < file_len:
-            # Search for the next metadata footer
-            next_footer = raw_bytes.find(FOOTER_MAGIC, cursor)
+            # Search for the next metadata trailer
+            next_trailer = raw_bytes.find(TRAILER_MAGIC, cursor)
 
-            # If no footer found, append the rest of the file and finish
-            if next_footer == -1:
+            # If no trailer found, append the rest of the file and finish
+            if next_trailer == -1:
                 clean_byte_stream.extend(raw_bytes[cursor:])
                 break
 
-            # --- EXTRACT FOOTER TIMESTAMP (For Logging/Validation) ---
-            # Footer Structure: [Magic:4] [Time:4] [Date:4] [SubsecFrac:2] [Subsec:2]
+            # --- EXTRACT TRAILER TIMESTAMP (For Logging/Validation) ---
+            # Trailer Structure: [Magic:4] [Time:4] [Date:4] [SubsecFrac:2] [Subsec:2]
             try:
-                # We extract 12 bytes starting 4 bytes after the footer magic
+                # We extract 12 bytes starting 4 bytes after the trailer magic
                 # offsets relative to magic: 0-3=Magic, 4-7=Time, 8-11=Date, 12-15=Ticks
-                ts_chunk = raw_bytes[next_footer+4 : next_footer+FOOTER_LEN]
+                ts_chunk = raw_bytes[next_trailer+4 : next_trailer+TRAILER_LEN]
 
-                if len(ts_chunk) == FOOTER_LEN-4:
+                if len(ts_chunk) == TRAILER_LEN-4:
                     # Time: HH(0), MM(1), SS(2), Pad(3)
                     hh, mm, ss = ts_chunk[0], ts_chunk[1], ts_chunk[2]
 
@@ -180,25 +180,41 @@ def parse_audio_file(filepath):
                 pass # Non-critical failure
 
             # --- CALCULATE CUTS ---
-            # Cut point Left: Footer Start and ensure we don't cut before the current cursor (overlap check)
-            cut_start = max(cursor, next_footer)
+            # Cut point Left: Trailer Start and ensure we don't cut before the current cursor (overlap check)
+            cut_start = max(cursor, next_trailer)
 
             # Append valid audio up to the cut point
             clean_byte_stream.extend(raw_bytes[cursor : cut_start])
 
-            # Advance Cursor: Skip the 16-byte Footer
-            cursor = next_footer + FOOTER_LEN
+            # Advance Cursor: Skip the 16-byte Trailer
+            cursor = next_trailer + TRAILER_LEN
 
-        # --- PART 4: FINALIZE AUDIO ---
+        # --- 4. FINALIZE AUDIO ---
         # Convert to Numpy Array (Signed 16-bit PCM)
         audio_data = np.frombuffer(clean_byte_stream, dtype='<i2')
 
-        # --- PART 5: MUTE STARTUP ARTIFACTS (The "Pop") ---
-        # The first ~17ms (approx 800 samples at 48k) often contain DC offset/wake-up noise.
-        # We mute the first 1000 samples to be safe.
+        # --- 5. DYNAMIC STARTUP ARTIFACT MUTE ---
+        # The microphone hardware takes variable time to stabilize, emitting garbage
+        # or a train of -32768 (0x8000) samples. We dynamically scan the start of the
+        # file and mute up to the last -32768 sample, requiring an 8-sample (16-byte)
+        # clean streak to confirm the initialization pop is truly over.
 
-        #if len(audio_data) > 1000:
-        #    audio_data[:1000] = 0
+        search_limit = min(len(audio_data), 10000)
+        mute_end_idx = 0
+        consecutive_clean = 0
+
+        for i in range(search_limit):
+            if audio_data[i] == -32768:
+                consecutive_clean = 0
+                mute_end_idx = i + 1  # We must mute at least up to this pop
+            else:
+                consecutive_clean += 1
+                if consecutive_clean >= 8:
+                    # 8 clean samples in a row confirms the artifact is over
+                    break
+
+        if mute_end_idx > 0:
+            audio_data[:mute_end_idx] = 0
 
         # FINAL CHECK: Did we end up with valid data?
         if len(audio_data) == 0:

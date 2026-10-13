@@ -7,10 +7,10 @@ import pandas as pd
 
 logger = logging.getLogger("vesperflow")
 
-# Footer constants — every IMU .BIN file ends with a 16-byte footer block.
-FOOTER_SIZE = 16
-FOOTER_SYNC = (
-    b"\xa5\x5a\x5a\xa5"  # End-of-file sync, distinct from header sync 5A A5 5A A5
+# Trailer constants — every IMU .BIN file ends with a 16-byte block trailer.
+TRAILER_SIZE = 16
+TRAILER_SYNC = (
+    b"\xa5\x5a\x5a\xa5"  # End-of-file sync patern, inverted from header sync 5A A5 5A A5
 )
 
 
@@ -21,7 +21,7 @@ def bcd_to_int(byte_val):
 
 def decode_binary_header(filepath, header_size):
     """
-    Decodes a dynamic sized header.
+    Decodes the standard 144-byte (128+16) IMU/Audio header.
     Returns a dictionary with raw common fields (IDs, SampleRate, Time, Configs).
     """
     if not os.path.exists(filepath):
@@ -30,49 +30,48 @@ def decode_binary_header(filepath, header_size):
     with open(filepath, "rb") as f:
         header = f.read(header_size)
 
-    # 1. Decode IDs
-    device_id = struct.unpack("<I", header[4:8])[0]
-    try:
-        sensor_name = header[8:24].split(b"\x00")[0].decode("ascii")
-    except:
-        sensor_name = "Unknown"
-
-    # 2. Decode Basic Configs
-    fwid = struct.unpack("<H", header[24:26])[0]
-    hwid = struct.unpack("<H", header[26:28])[0]
-
-    sample_rate = struct.unpack("<I", header[28:32])[0]
-
-    win_len = struct.unpack("<I", header[32:36])[0]
-    win_rate = struct.unpack("<I", header[36:40])[0]
-
-    bitmask = struct.unpack("<I", header[40:44])[0]
-
-    # 3. Decode Extended Configs (Offsets 44, 48, 52, 56)
-    config0 = struct.unpack("<I", header[44:48])[0]
-    config1 = struct.unpack("<I", header[48:52])[0]
-    config2 = struct.unpack("<I", header[52:56])[0]
-    config3 = struct.unpack("<I", header[56:60])[0]
-
-    # 4. Decode BCD Timestamp
-    # Header timestamp region layout (bytes 128-143):
-    #   128-131: Sync word (0x5AA55AA5)
-    #   132:     Hour (BCD)
-    #   133:     Minute (BCD)
-    #   134:     Second (BCD)
-    #   135:     Always 0x00 (padding after seconds)
-    #   136:     Header_B136 — see note below
-    #   137:     Month (BCD)
-    #   138:     Day (BCD)
-    #   139:     Year (BCD, offset from 2000)
-    #   140-141: Subsecond resolution (uint16, typically 1023 = 0x03FF)
-    #   142-143: Subsecond value at FIRST SAMPLE (uint16)
-
-    if len(header) < 144:
-        logger.error(f"Header too short in {filepath}")
+    if len(header) < header_size:
+        logger.error(f"Header parse error: truncated file at {filepath}")
         return None
 
+    # --- 1. Decode metadata (IDs and configs) ---
     try:
+        device_id = struct.unpack("<I", header[4:8])[0]
+        try:
+            sensor_name = header[8:24].split(b"\x00")[0].decode("ascii")
+        except Exception:
+            sensor_name = "Unknown"
+
+        fwid = struct.unpack("<H", header[24:26])[0]
+        hwid = struct.unpack("<H", header[26:28])[0]
+        sample_rate = struct.unpack("<I", header[28:32])[0]
+        win_len = struct.unpack("<I", header[32:36])[0]
+        win_rate = struct.unpack("<I", header[36:40])[0]
+        bitmask = struct.unpack("<I", header[40:44])[0]
+
+        config0 = struct.unpack("<I", header[44:48])[0]
+        config1 = struct.unpack("<I", header[48:52])[0]
+        config2 = struct.unpack("<I", header[52:56])[0]
+        config3 = struct.unpack("<I", header[56:60])[0]
+
+        # --- 2. Decode BCD Timestamp ---
+        # Header timestamp region layout (bytes 128-143):
+        #   128-131: Sync Magic Number (0x5AA55AA5)
+        #   132:     Hour (BCD)
+        #   133:     Minute (BCD)
+        #   134:     Second (BCD)
+        #   135:     Always 0x00 (padding after seconds)
+        #   136:     Header_B136 — see note below
+        #   137:     Month (BCD)
+        #   138:     Day (BCD)
+        #   139:     Year (BCD, offset from 2000)
+        #   140-141: Subsecond resolution (uint16, typically 1023 = 0x03FF)
+        #   142-143: Subsecond value at FIRST SAMPLE (uint16)
+
+        if len(header) < 144:
+            logger.error(f"Header too short in {filepath}")
+            return None
+
         h = bcd_to_int(header[132])
         m = bcd_to_int(header[133])
         s = bcd_to_int(header[134])
@@ -80,17 +79,21 @@ def decode_binary_header(filepath, header_size):
         day = bcd_to_int(header[138])
         year = 2000 + bcd_to_int(header[139])
         start_dt = datetime(year, month, day, h, m, s)
+
+    except struct.error:
+        logger.warning(f"Header parse error: corrupted header at {filepath}")
+        return None
     except ValueError:
         start_dt = datetime.fromtimestamp(os.path.getmtime(filepath))
 
-    # 5. Header_B136 — byte at offset 136, between the time pad and the date fields.
+    # --- 3. Header_B136 — byte at offset 136, between the time pad and the date fields. ---
     #
     # CONFIRMED BEHAVIOUR (from multi-session, multi-device analysis):
     #   - Stable across all sequential files within a single recording session.
-    #   - Mirrored in the file footer at offset 8 (footer's B8 == header's B136).
+    #   - Mirrored in the file trailer at offset 8 (trailer's B8 == header's B136).
     #   - Can differ between sessions from the same device.
     #   - Observed values: 0x01, 0x04, 0x07 — small integers in range 1-7.
-    #   - Not correlated with: device ID, calendar date, day-of-week, hour,
+    #   - Suspected to not be correlated directly with: device ID, calendar date, day-of-week, hour,
     #     bitmask, Config0, FWID, or subsecond resolution.
     #
     # LEADING THEORY: per-session configuration preset or schedule slot index.
@@ -121,19 +124,59 @@ def decode_binary_header(filepath, header_size):
         "Start_Time": start_dt,
     }
 
-
-def decode_binary_footer(filepath):
+def decode_gps_header(filepath):
     """
-    Reads and decodes the 16-byte footer at the end of an IMU .BIN file.
+    Decodes the 16-byte GPS snapshot header and checks for the 1024-byte warm-up buffer.
+    """
+    MAGIC_NUMBER = 0xA55AA55A
+    if not os.path.exists(filepath):
+        return None
 
-    Footer layout (16 bytes):
-      0-3:   Sync word (A5 5A 5A A5) — bitwise complement of header sync
+    with open(filepath, 'rb') as f:
+        header_chunk = f.read(1024)
+
+    if len(header_chunk) < 16:
+        return None
+
+    magic = struct.unpack('<I', header_chunk[0:4])[0]
+    if magic != MAGIC_NUMBER:
+        return None
+
+    try:
+        h = bcd_to_int(header_chunk[4])
+        m = bcd_to_int(header_chunk[5])
+        s = bcd_to_int(header_chunk[6])
+        mon = bcd_to_int(header_chunk[9])
+        day = bcd_to_int(header_chunk[10])
+        year = 2000 + bcd_to_int(header_chunk[11])
+        start_dt = datetime(year, mon, day, h, m, s)
+    except ValueError:
+        return None
+
+    # Smart Header Detection: 1024-byte warm-up pad
+    if len(header_chunk) == 1024 and all(b == 0 for b in header_chunk[16:]):
+        header_size = 1024
+    else:
+        header_size = 16
+
+    return {
+        "Sensor": "GPS",
+        "Start_Time": start_dt,
+        "Header_Size": header_size
+    }
+
+def decode_binary_trailer(filepath):
+    """
+    Reads and decodes the 16-byte trailer at the end of an IMU .BIN file.
+
+    Trailer layout (16 bytes):
+      0-3:   Sync number (A5 5A 5A A5) — bitwise complement of header sync
       4:     End Hour (BCD)
       5:     End Minute (BCD)
       6:     End Second (BCD)
-      7:     Footer_B7 — varies between files, exact meaning undocumented
+      7:     Trailer_B7 — varies between files, exact meaning undocumented
              (possibly a counter, checksum, or firmware state byte)
-      8:     Footer_B8 — mirrors the header's Header_B136 value (per-session marker)
+      8:     Trailer_B8 — mirrors the header's Header_B136 value (per-session marker)
       9:     End Month (BCD)
       10:    End Day (BCD)
       11:    End Year (BCD, offset from 2000)
@@ -143,41 +186,41 @@ def decode_binary_footer(filepath):
              the actual final packet.
 
     Returns:
-        dict with footer fields, or None if the footer sync is invalid /
-        the file is too short. A missing or invalid footer indicates the
+        dict with trailer fields, or None if the trailer sync is invalid /
+        the file is too short. A missing or invalid trailer indicates the
         recording was truncated (battery died, SD full, write interrupted).
     """
     if not os.path.exists(filepath):
         return None
 
     file_size = os.path.getsize(filepath)
-    if file_size < FOOTER_SIZE:
+    if file_size < TRAILER_SIZE:
         return None
 
     with open(filepath, "rb") as f:
-        f.seek(file_size - FOOTER_SIZE)
-        footer = f.read(FOOTER_SIZE)
+        f.seek(file_size - TRAILER_SIZE)
+        trailer = f.read(TRAILER_SIZE)
 
-    if footer[0:4] != FOOTER_SYNC:
-        # Footer sync not found — file is truncated or corrupt.
+    if trailer[0:4] != TRAILER_SYNC:
+        # Trailer sync not found — file is truncated or corrupt.
         return None
 
     try:
-        h = bcd_to_int(footer[4])
-        m = bcd_to_int(footer[5])
-        s = bcd_to_int(footer[6])
-        month = bcd_to_int(footer[9])
-        day = bcd_to_int(footer[10])
-        year = 2000 + bcd_to_int(footer[11])
+        h = bcd_to_int(trailer[4])
+        m = bcd_to_int(trailer[5])
+        s = bcd_to_int(trailer[6])
+        month = bcd_to_int(trailer[9])
+        day = bcd_to_int(trailer[10])
+        year = 2000 + bcd_to_int(trailer[11])
         end_dt = datetime(year, month, day, h, m, s)
     except ValueError:
         return None
 
-    ss_res = struct.unpack("<H", footer[12:14])[0]
-    ss_val = struct.unpack("<H", footer[14:16])[0]
+    ss_res = struct.unpack("<H", trailer[12:14])[0]
+    ss_val = struct.unpack("<H", trailer[14:16])[0]
 
     # Time-within-second (ms) — same formula as header.
-    # Footer ss_val represents the tick of the sample that WOULD HAVE been
+    # Trailer ss_val represents the tick of the sample that WOULD HAVE been
     # the next one after the last actually-recorded sample.
     denom = float(ss_res + 1.0) if ss_res > 0 else 1.0
     end_ms = 1000.0 * (ss_res - ss_val) / denom
@@ -189,8 +232,8 @@ def decode_binary_footer(filepath):
         "End_Time_Coarse": end_dt,
         "End_ss_res": ss_res,
         "End_ss_val": ss_val,
-        "Footer_B7": footer[7],
-        "Footer_B8": footer[8],
+        "Trailer_B7": trailer[7],
+        "Trailer_B8": trailer[8],
     }
 
 
@@ -203,7 +246,7 @@ def get_precise_start_time(filepath, meta, sensor_type="STD"):
     where per-packet timing is not available.
 
     Args:
-        sensor_type: "STD", "IMU", "AUD" (150 byte header) or "GPS" (16 byte header)
+        sensor_type: "STD", "IMU", "AUD" (144 byte header) or "GPS" (16 byte header)
     """
     precise_time = meta["Start_Time"]
 

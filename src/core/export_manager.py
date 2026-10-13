@@ -75,7 +75,7 @@ class ExportManager:
 
         # Header_B136: per-session byte at offset 136 of the binary header.
         # Stable across all files in a recording session; mirrored in the
-        # footer's B8. Exact meaning undocumented — logged for future analysis.
+        # trailer's B8. Exact meaning undocumented — logged for future analysis.
         # Leading theory: per-session configuration preset or schedule slot index.
         # Alternatives: session sequence counter, firmware state flag,
         #               schedule/program index, Cell-Guide internal field.
@@ -85,18 +85,18 @@ class ExportManager:
         else:
             lines.append("Header_B136:N/A")
 
-        # Footer fields — only present for files with a valid (non-truncated) footer.
-        # Footer_B7: varies between files within the same session. Exact meaning
+        # Trailer fields — only present for files with a valid (non-truncated) trailer.
+        # Trailer_B7: varies between files within the same session. Exact meaning
         # undocumented — possibly a counter or checksum.
-        # Footer_B8: mirrors Header_B136 in well-formed files.
-        if "Footer_B7" in meta and isinstance(meta["Footer_B7"], int):
-            lines.append(f"Footer_B7:{meta['Footer_B7']:02X}")
-        if "Footer_B8" in meta and isinstance(meta["Footer_B8"], int):
-            lines.append(f"Footer_B8:{meta['Footer_B8']:02X}")
+        # Trailer_B8: mirrors Header_B136 in well-formed files.
+        if "Trailer_B7" in meta and isinstance(meta["Trailer_B7"], int):
+            lines.append(f"Trailer_B7:{meta['Trailer_B7']:02X}")
+        if "Trailer_B8" in meta and isinstance(meta["Trailer_B8"], int):
+            lines.append(f"Trailer_B8:{meta['Trailer_B8']:02X}")
 
-        # --- SCHEDULE-AWARE TRUNCATION LOGIC: Explicitly log if the footer was found and the resulting recording status
-        if "Footer_Present" in meta:
-            lines.append(f"Footer_Present:{meta['Footer_Present']}")
+        # --- SCHEDULE-AWARE TRUNCATION LOGIC: Explicitly log if the trailer was found and the resulting recording status
+        if "Trailer_Present" in meta:
+            lines.append(f"Trailer_Present:{meta['Trailer_Present']}")
         if "Recording_Status" in meta:
             lines.append(f"Recording_Status:{meta['Recording_Status']}")
 

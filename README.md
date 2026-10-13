@@ -23,7 +23,7 @@ The native parsers utilize a standardized **128-byte File Header** and **16-byte
 - **Dynamic Configuration:** Detects the active bitmask and dynamically outputs **Temperature (°C)** and **Barometric Pressure (hPa)** if extended sensors are active.
 
 ### 🎙️ **Audio (Microphone):**
-- **16-Byte Block Excisions:** Surgically removes the 16-byte metadata footers injected at every 64KB page boundary. This mathematically preserves 16-bit sample alignment across the entire stream.
+- **16-Byte Block Excisions:** Surgically removes the 16-byte sync markers injected at every 64KB page boundary. This mathematically preserves 16-bit sample alignment across the entire stream.
 - **Strict RIFF Compliance:** Writes mathematically precise `.wav` (48kHz) headers using native Python libraries, fixing the 16-byte chunk truncation bug found in proprietary extraction tools that causes ML acoustic libraries to crash.
 - **DC-Offset Mitigation:** Mutes the ~17ms (`0x8000`) startup pop caused by microphone hardware initialization.
 
