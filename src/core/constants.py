@@ -1,6 +1,6 @@
 # Global Constants
 PROJECT_NAME = "VesperFLow"
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 BUILD_TYPE = (
     ""  # Leave empty for stable/release versions. Use "Beta" or "Alpha" for testing.
 )

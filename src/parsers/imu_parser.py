@@ -5,8 +5,8 @@ import numpy as np
 import pandas as pd
 
 from src.core.binary_decoder import (
-    FOOTER_SIZE,
-    decode_binary_footer,
+    TRAILER_SIZE,
+    decode_binary_trailer,
     decode_binary_header,
 )
 
@@ -18,7 +18,7 @@ logger = logging.getLogger("vesperflow")
 HEADER_SIZE = 144
 
 # Subsecond tick scale — every IMU file observed uses 1023-tick resolution.
-# The header, footer, and per-packet pkt_ts all share this scale.
+# The header, trailer, and per-packet pkt_ts all share this scale.
 TICK_RESOLUTION = 1023
 TICK_DENOM = (
     TICK_RESOLUTION + 1
@@ -132,7 +132,7 @@ def parse_imu_file(filepath):
     | 52-55   | UInt32   | Config2                             |
     | 56-59   | UInt32   | Config3                             |
     | 60-127  | Pad      | Padding (0xFF)                      |
-    | 128-131 | UInt32   | Timestamp Sync Word (0x5AA55AA5)    |
+    | 128-131 | UInt32   | Timestamp Sync Number (0x5AA55AA5)  |
     | 132     | BCD      | Start Hour                          |
     | 133     | BCD      | Start Minute                        |
     | 134     | BCD      | Start Second                        |
@@ -153,7 +153,7 @@ def parse_imu_file(filepath):
     | acc     | 12 bytes | X, Y, Z float32 (mg)                |
     | mag     | 12 bytes | X, Y, Z float32 (mGauss)            |
     | temp*   | 2 bytes  | uint16 raw * 0.01 = °C (ext only)   |
-    | pres*   | 2 bytes  | uint16 raw = hPa   (ext only)        |
+    | pres*   | 2 bytes  | uint16 raw = hPa   (ext only)       |
     ------------------------------------------------------------
 
     FORMAT VARIANTS (driven by Bitmask — see _get_format_config):
@@ -180,15 +180,15 @@ def parse_imu_file(filepath):
     |          |               | needed                        |
     ------------------------------------------------------------
 
-    FOOTER (last 16 bytes of file):
+    TRAILER (last 16 bytes of file):
     ------------------------------------------------------------
-    | Byte 0-3 | A5 5A 5A A5  | End sync (NOT of header sync) |
+    | Byte 0-3 | A5 5A 5A A5  | End sync (NOT of header sync)  |
     | Byte 4   | BCD          | End Hour                       |
     | Byte 5   | BCD          | End Minute                     |
     | Byte 6   | BCD          | End Second                     |
-    | Byte 7   | UInt8        | Footer_B7 — varies per file,   |
+    | Byte 7   | UInt8        | Trailer_B7 — varies per file,  |
     |          |              | undocumented                   |
-    | Byte 8   | UInt8        | Footer_B8 — mirrors Header_B136|
+    | Byte 8   | UInt8        | Trailer_B8 — mirrors Header_B136|
     | Byte 9   | BCD          | End Month                      |
     | Byte 10  | BCD          | End Day                        |
     | Byte 11  | BCD          | End Year (offset from 2000)    |
@@ -212,32 +212,32 @@ def parse_imu_file(filepath):
         except Exception as e:
             return "FAIL", f"Header parse error: {str(e)}", None, None
 
-        # --- PART 2: FOOTER PARSING ---
-        # The footer carries the authoritative end timestamp (sub-millisecond
+        # --- PART 2: TRAILER PARSING ---
+        # The trailer carries the authoritative end timestamp (sub-millisecond
         # precision) and a B8 byte that mirrors the header's Header_B136.
-        footer = decode_binary_footer(filepath)
-        if footer is None:
+        trailer = decode_binary_trailer(filepath)
+        if trailer is None:
             logger.warning(
-                f"Footer missing in {os.path.basename(filepath)} — "
+                f"Trailer missing in {os.path.basename(filepath)} — "
                 f"recording was interrupted (Scheduled Sleep OR Battery Exhaustion)."
             )
             # Replace the generic "Truncated" flag with explicit, dual-cause statuses
-            meta["Footer_Present"] = "FALSE"
+            meta["Trailer_Present"] = "FALSE"
             meta["Recording_Status"] = "INTERRUPTED (Scheduled Sleep or Battery Exhaustion)"
 
             # (non-mandatory) If there is downstream code that still strictly expects a boolean
             # for the report card, you can keep meta["Truncated"] = True here as a fallback!
         else:
-            meta["Footer_Present"] = "TRUE"
+            meta["Trailer_Present"] = "TRUE"
             meta["Recording_Status"] = "COMPLETED"
-            meta["End_Time"] = footer["End_Time"]
-            meta["Footer_B7"] = footer["Footer_B7"]
-            meta["Footer_B8"] = footer["Footer_B8"]
+            meta["End_Time"] = trailer["End_Time"]
+            meta["Trailer_B7"] = trailer["Trailer_B7"]
+            meta["Trailer_B8"] = trailer["Trailer_B8"]
 
-            # Sanity check: footer B8 should mirror header B136
-            if footer["Footer_B8"] != meta["Header_B136"]:
+            # Sanity check: trailer B8 should mirror header B136
+            if trailer["Trailer_B8"] != meta["Header_B136"]:
                 logger.debug(
-                    f"Footer B8 (0x{footer['Footer_B8']:02X}) differs from "
+                    f"Trailer B8 (0x{trailer['Trailer_B8']:02X}) differs from "
                     f"Header_B136 (0x{meta['Header_B136']:02X}) in {filepath}"
                 )
 
@@ -251,13 +251,13 @@ def parse_imu_file(filepath):
         )
 
         # --- PART 4: PARSE DATA PAYLOAD ---
-        # Read the body between header and footer. If footer is missing, read
+        # Read the body between header and trailer. If trailer is missing, read
         # everything after the header (np.fromfile will stop at the last full
         # packet automatically, leaving any trailing bytes unparsed).
         try:
             file_size = os.path.getsize(filepath)
-            if footer is not None:
-                payload_size = file_size - HEADER_SIZE - FOOTER_SIZE
+            if trailer is not None:
+                payload_size = file_size - HEADER_SIZE - TRAILER_SIZE
             else:
                 payload_size = file_size - HEADER_SIZE
 
@@ -401,16 +401,17 @@ def parse_imu_file(filepath):
         df = pd.DataFrame(data)
 
         # --- FILE-SPLIT HICCUP FILTER ---
-        # A hardware SD-card write glitch causes the gyroscope to occasionally
+        # A hardware write glitch causes the gyroscope to occasionally
         # output exactly -8.75 (hex: 00 00 0C C1) across all three axes at the start of new files.
-        hiccup_mask = (
-            (df['gyro_x'] == -8.75) &
-            (df['gyro_y'] == -8.75) &
-            (df['gyro_z'] == -8.75)
-        )
 
-        # Convert the corrupted gyroscope readings to NaN (Not a Number)
-        df.loc[hiccup_mask, ['gyro_x', 'gyro_y', 'gyro_z']] = np.nan
+        # 1. Dynamically find the Gyro X, Y, and Z columns using a case-insensitive regex
+        gyro_cols = df.filter(regex=r'(?i)gyro\s+[xyz]').columns
+
+        # 2. Build the mask by checking if ALL dynamically found gyro columns equal -8.75
+        hiccup_mask = (df[gyro_cols] == -8.75).all(axis=1)
+
+        # 3. Convert the corrupted gyroscope readings to NaN (Not a Number)
+        df.loc[hiccup_mask, gyro_cols] = np.nan
 
         cols_order = [
             "Time",

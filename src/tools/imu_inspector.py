@@ -12,7 +12,7 @@ LOCATION:
 USAGE (run from project root):
 -------------------------------
 1. Metadata Report (default):
-   Prints header fields, bitmask decoded bit-by-bit, footer (if present),
+   Prints header fields, bitmask decoded bit-by-bit, trailer (if present),
    and the auto-detected packet format configuration.
    $ python -m src.tools.imu_inspector ./data/raw/00M.BIN
 
@@ -65,8 +65,8 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.core.binary_decoder import (
-    FOOTER_SIZE,
-    decode_binary_footer,
+    TRAILER_SIZE,
+    decode_binary_trailer,
     decode_binary_header,
 )
 from src.parsers.imu_parser import _build_dtype, _get_format_config
@@ -131,7 +131,7 @@ def print_metadata(filepath):
     print(
         f"{'  B136 note:':<20} Per-session byte, stable across all files in a session."
     )
-    print(f"{'':20} Mirrored at footer byte 8 — confirms preservation end-to-end.")
+    print(f"{'':20} Mirrored at trailer byte 8 — confirms preservation end-to-end.")
     print(f"{'':20} Leading theory: config preset or schedule slot index.")
 
     print(
@@ -176,45 +176,45 @@ def print_metadata(filepath):
     )
     print(f"  {'pkt_ts (bytes 0-5):':<22} sync + fmt + min + sec + uint16 subsec ticks")
 
-    # --- Footer ---
+    # --- Trailer ---
     print(f"\n{_divider('-')}")
-    print("  FOOTER (last 16 bytes)")
+    print("  TRAILER (last 16 bytes)")
     print(_divider("-"))
-    footer = decode_binary_footer(filepath)
-    if footer:
-        print(f"  End Time:           {footer['End_Time'].strftime('%d/%m/%Y %H:%M:%S.%f')[:-3]}")
-        print(f"  Footer ss_res:      {footer['End_ss_res']}")
-        end_ms = 1000.0 * (footer['End_ss_res'] - footer['End_ss_val']) / (footer['End_ss_res'] + 1.0)
-        print(f"  Footer ss_val:      {footer['End_ss_val']}  ({end_ms:.2f}ms past second)")
-        print(f"  Footer B7:          0x{footer['B7']:02X} — varies per file (counter or checksum?)")
-        print(f"  Footer B8:          0x{footer['B8']:02X} — should mirror Header_B136 (0x{b136:02X})")
-        if footer["B8"] != b136:
-            print(f"     <<< MISMATCH between Footer B8 and Header B136!")
+    trailer = decode_binary_trailer(filepath)
+    if trailer:
+        print(f"  End Time:           {trailer['End_Time'].strftime('%d/%m/%Y %H:%M:%S.%f')[:-3]}")
+        print(f"  Trailer ss_res:      {trailer['End_ss_res']}")
+        end_ms = 1000.0 * (trailer['End_ss_res'] - trailer['End_ss_val']) / (trailer['End_ss_res'] + 1.0)
+        print(f"  Trailer ss_val:      {trailer['End_ss_val']}  ({end_ms:.2f}ms past second)")
+        print(f"  Trailer B7:          0x{trailer['B7']:02X} — varies per file (counter or checksum?)")
+        print(f"  Trailer B8:          0x{trailer['B8']:02X} — should mirror Header_B136 (0x{b136:02X})")
+        if trailer["B8"] != b136:
+            print(f"     <<< MISMATCH between Trailer B8 and Header B136!")
         else:
             print(f"     OK — B8 mirrors B136")
 
-        # Compute session duration from header start to footer end
+        # Compute session duration from header start to trailer end
         start_dt = meta["Start_Time"]
-        end_dt = footer["End_Time"]
+        end_dt = trailer["End_Time"]
         duration = (end_dt - start_dt).total_seconds()
         h_dur = int(duration // 3600)
         m_dur = int((duration % 3600) // 60)
         s_dur = int(duration % 60)
         print(
-            f"  Session duration:   {h_dur}h {m_dur}m {s_dur}s  (from header BCD to footer BCD)"
+            f"  Session duration:   {h_dur}h {m_dur}m {s_dur}s  (from header BCD to trailer BCD)"
         )
     else:
-        print("  No valid footer — file may be truncated.")
+        print("  No valid trailer — file may be truncated.")
 
     # --- Packet count ---
-    payload = fsize - HEADER_SIZE - (FOOTER_SIZE if footer else 0)
+    payload = fsize - HEADER_SIZE - (TRAILER_SIZE if trailer else 0)
     n_packets = payload // fmt["packet_size"]
     remainder = payload % fmt["packet_size"]
     duration_s = n_packets / meta["SampleRate"] if meta["SampleRate"] > 0 else 0
 
     print(f"\n{_divider('-')}")
     print(
-        f"  PACKET COUNT  ({fmt['packet_size']}B packets, footer {'subtracted' if footer else 'not present'})"
+        f"  PACKET COUNT  ({fmt['packet_size']}B packets, trailer {'subtracted' if trailer else 'not present'})"
     )
     print(_divider("-"))
     print(f"  {'Payload bytes:':<22} {payload:,}")
@@ -266,10 +266,10 @@ def scan_packet_size(filepath):
     print(f"  {filepath}")
     print(_divider())
 
-    # Subtract footer if present so the scan doesn't see footer bytes as junk
-    footer = decode_binary_footer(filepath)
+    # Subtract trailer if present so the scan doesn't see trailer bytes as junk
+    trailer = decode_binary_trailer(filepath)
     file_size = os.path.getsize(filepath)
-    payload_end = file_size - FOOTER_SIZE if footer else file_size
+    payload_end = file_size - TRAILER_SIZE if trailer else file_size
 
     with open(filepath, "rb") as f:
         f.seek(HEADER_SIZE)
@@ -277,7 +277,7 @@ def scan_packet_size(filepath):
 
     total_bytes = len(payload)
     print(
-        f"\n  Payload: {total_bytes:,} bytes (footer {'excluded' if footer else 'not present'})\n"
+        f"\n  Payload: {total_bytes:,} bytes (trailer {'excluded' if trailer else 'not present'})\n"
     )
     print(f"  Checking packet sizes {PACKET_SIZE_MIN} – {PACKET_SIZE_MAX} bytes.")
     print(
@@ -351,10 +351,10 @@ def decode_packets(filepath, n_packets=10):
     fmt = _get_format_config(bitmask)
     dt = _build_dtype(fmt)
 
-    # Read body excluding footer
-    footer = decode_binary_footer(filepath)
+    # Read body excluding trailer
+    trailer = decode_binary_trailer(filepath)
     file_size = os.path.getsize(filepath)
-    payload_end = file_size - FOOTER_SIZE if footer else file_size
+    payload_end = file_size - TRAILER_SIZE if trailer else file_size
     n_in_file = (payload_end - HEADER_SIZE) // fmt["packet_size"]
 
     with open(filepath, "rb") as f:
@@ -518,9 +518,9 @@ def hex_packets(filepath, n_packets=20):
     psize = fmt["packet_size"]
     has_tp = fmt["has_temp_pres"]
 
-    footer = decode_binary_footer(filepath)
+    trailer = decode_binary_trailer(filepath)
     file_size = os.path.getsize(filepath)
-    payload_end = file_size - FOOTER_SIZE if footer else file_size
+    payload_end = file_size - TRAILER_SIZE if trailer else file_size
 
     with open(filepath, "rb") as f:
         f.seek(HEADER_SIZE)
@@ -597,20 +597,20 @@ def _find_sequential_files(start_filepath, n_files, use_all=False):
 
 def _load_pkt_ts(filepath, fmt_config):
     """
-    Reads all pkt_ts fields from a file's payload (excluding footer).
+    Reads all pkt_ts fields from a file's payload (excluding trailer).
     Returns numpy array of shape (N, 6), dtype uint8.
     """
     file_size = os.path.getsize(filepath)
     psize = fmt_config["packet_size"]
-    footer_ok = False
+    trailer_ok = False
 
-    # Check footer
+    # Check trailer
     with open(filepath, "rb") as f:
-        f.seek(file_size - FOOTER_SIZE)
-        footer_sync = f.read(4)
-    if footer_sync == b"\xa5\x5a\x5a\xa5":
-        footer_ok = True
-        payload_size = file_size - HEADER_SIZE - FOOTER_SIZE
+        f.seek(file_size - TRAILER_SIZE)
+        trailer_sync = f.read(4)
+    if trailer_sync == b"\xa5\x5a\x5a\xa5":
+        trailer_ok = True
+        payload_size = file_size - HEADER_SIZE - TRAILER_SIZE
     else:
         payload_size = file_size - HEADER_SIZE
 
@@ -625,7 +625,7 @@ def _load_pkt_ts(filepath, fmt_config):
     if len(raw) > 1 and np.array_equal(raw["pkt_ts"][0], raw["pkt_ts"][1]):
         raw = raw[1:]
 
-    return raw["pkt_ts"].copy(), footer_ok
+    return raw["pkt_ts"].copy(), trailer_ok
 
 
 def analyze_drift_rhythm(filepath, n_files=3, use_all=False):
@@ -639,9 +639,9 @@ def analyze_drift_rhythm(filepath, n_files=3, use_all=False):
       - Correlation of packet count with the last digit of the sec field
 
     At each file boundary it computes:
-      - Footer end time vs next header start time
+      - Trailer end time vs next header start time
       - Gap in ms between files
-      - First packet tick of the new file vs footer ss_val
+      - First packet tick of the new file vs trailer ss_val
 
     The sec field in pkt_ts is known to lag behind the tick wrap (by a variable
     number of packets — 1 to 20+ observed). This tool is specifically designed
@@ -679,7 +679,7 @@ def analyze_drift_rhythm(filepath, n_files=3, use_all=False):
             continue
 
         fmt = _get_format_config(meta.get("Bitmask", 0))
-        pkt_ts, footer_ok = _load_pkt_ts(fp, fmt)
+        pkt_ts, trailer_ok = _load_pkt_ts(fp, fmt)
         fname = os.path.basename(fp)
         n_total = len(pkt_ts)
 
@@ -728,27 +728,27 @@ def analyze_drift_rhythm(filepath, n_files=3, use_all=False):
             digit_groups[sc % 10].append(cnt)
 
         # Store for boundary analysis
-        footer_data = None
-        if footer_ok:
+        trailer_data = None
+        if trailer_ok:
             file_size = os.path.getsize(fp)
             with open(fp, "rb") as f:
-                f.seek(file_size - FOOTER_SIZE)
-                footer_raw = f.read(FOOTER_SIZE)
-            if len(footer_raw) == FOOTER_SIZE:
+                f.seek(file_size - TRAILER_SIZE)
+                trailer_raw = f.read(TRAILER_SIZE)
+            if len(trailer_raw) == TRAILER_SIZE:
 
                 def bcd(b):
                     return (b // 16) * 10 + (b % 16)
 
-                end_h = bcd(footer_raw[4])
-                end_m = bcd(footer_raw[5])
-                end_s = bcd(footer_raw[6])
-                end_mo = bcd(footer_raw[9])
-                end_da = bcd(footer_raw[10])
-                end_yr = 2000 + bcd(footer_raw[11])
-                ss_res = struct.unpack("<H", footer_raw[12:14])[0]
-                ss_val = struct.unpack("<H", footer_raw[14:16])[0]
+                end_h = bcd(trailer_raw[4])
+                end_m = bcd(trailer_raw[5])
+                end_s = bcd(trailer_raw[6])
+                end_mo = bcd(trailer_raw[9])
+                end_da = bcd(trailer_raw[10])
+                end_yr = 2000 + bcd(trailer_raw[11])
+                ss_res = struct.unpack("<H", trailer_raw[12:14])[0]
+                ss_val = struct.unpack("<H", trailer_raw[14:16])[0]
                 end_ms = 1000.0 * (ss_res - ss_val) / (ss_res + 1.0)
-                footer_data = {
+                trailer_data = {
                     "h": end_h,
                     "m": end_m,
                     "s": end_s,
@@ -773,7 +773,7 @@ def analyze_drift_rhythm(filepath, n_files=3, use_all=False):
                 "count_dist": count_dist,
                 "digit_groups": digit_groups,
                 "n_total": n_total,
-                "footer_data": footer_data,
+                "trailer_data": trailer_data,
             }
         )
 
@@ -932,15 +932,15 @@ def analyze_drift_rhythm(filepath, n_files=3, use_all=False):
             print(f"\n  {curr['fname']} → {nxt['fname']}")
             print(f"  {'-' * 60}")
 
-            # Footer of curr
-            if curr["footer_data"]:
-                fd = curr["footer_data"]
+            # Trailer of curr
+            if curr["trailer_data"]:
+                fd = curr["trailer_data"]
                 print(
-                    f"  Footer end:     {fd['h']:02d}:{fd['m']:02d}:{fd['s']:02d}.{fd['ms']:03.0f}ms"
+                    f"  Trailer end:     {fd['h']:02d}:{fd['m']:02d}:{fd['s']:02d}.{fd['ms']:03.0f}ms"
                     f"  (ss_val={fd['ss_val']})"
                 )
             else:
-                print(f"  Footer:         MISSING — {curr['fname']} may be truncated")
+                print(f"  Trailer:         MISSING — {curr['fname']} may be truncated")
 
             # Header of nxt
             nm = nxt["meta"]
@@ -979,8 +979,8 @@ def analyze_drift_rhythm(filepath, n_files=3, use_all=False):
                 )
 
             # Gap between files
-            if curr["footer_data"]:
-                fd = curr["footer_data"]
+            if curr["trailer_data"]:
+                fd = curr["trailer_data"]
                 end_abs_ms = (fd["h"] * 3600 + fd["m"] * 60 + fd["s"]) * 1000 + fd["ms"]
                 start_abs_ms = (
                     st.hour * 3600 + st.minute * 60 + st.second
