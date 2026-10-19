@@ -14,13 +14,9 @@ Designed specifically for machine learning and database ingestion workflows, thi
 
 Key Features
 -----------------------
-The native parsers utilize a standardized **128-byte File Header** and **16-byte Block Header** architecture to unpack payloads, while automatically mitigating known hardware quirks:
-
-Key Features
------------------------
 Vesper tags write raw data using a **128-byte File Header** and **16-byte Block Header** layout with several undocumented hardware quirks. VesperFlow unpacks these streams in memory and cleans up the artifacts before writing analysis-ready files:
 
-### 1. Sensor Processing & Hardware Fixes
+### Sensor Processing & Hardware Fixes
 
 #### IMU (Accelerometer, Gyroscope & Magnetometer)
 - Reconstructs per-packet timestamps directly from the hardware's 1024-tick sub-second counter using vectorized NumPy operations.
