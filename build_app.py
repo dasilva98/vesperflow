@@ -71,6 +71,19 @@ print(f"\n>>> Organizing Output into '{FOLDER_NAME}'...")
 dist_root = "dist"
 final_folder_path = os.path.join(dist_root, FOLDER_NAME)
 
+# On Linux/macOS, PyInstaller's onefile binary has no extension, so its name
+# exactly matches FOLDER_NAME (when BUILD_TYPE is empty). That means the binary
+# and the folder we are about to create collide on the same path. On Windows
+# the binary is "*.exe", so no collision occurs and this block is a no-op.
+# When a collision is detected, move the binary aside; it is restored inside
+# the folder in section B below.
+binary_collision_path = None
+if os.path.isfile(final_folder_path):
+    binary_collision_path = final_folder_path + ".tmp_binary"
+    if os.path.exists(binary_collision_path):
+        os.remove(binary_collision_path)
+    os.rename(final_folder_path, binary_collision_path)
+
 # A. Create the Root Folder Structure
 os.makedirs(final_folder_path, exist_ok=True)
 os.makedirs(os.path.join(final_folder_path, "logs"), exist_ok=True)
@@ -82,7 +95,11 @@ os.makedirs(os.path.join(final_folder_path, "data", "ephemeris"), exist_ok=True)
 src_exe = os.path.join(dist_root, binary_name)
 dst_exe = os.path.join(final_folder_path, binary_name)
 
-if os.path.exists(src_exe):
+if binary_collision_path is not None:
+    # Linux/macOS: binary was moved aside above so we could create the folder.
+    os.rename(binary_collision_path, dst_exe)
+    print(f"[Move] Moved binary to {dst_exe}")
+elif os.path.exists(src_exe):
     shutil.move(src_exe, dst_exe)
     print(f"[Move] Moved binary to {dst_exe}")
 else:
