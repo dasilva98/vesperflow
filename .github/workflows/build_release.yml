@@ -1,12 +1,12 @@
-name: Build and Release Windows Executable
+name: Build and Release Executables
 
-# -----------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # TRIGGERS
-# -----------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # 1. Automatic: push a version tag (e.g. git tag v1.3.0 && git push --tags)
 # 2. Manual:    Actions tab → "Run workflow" → dispatches on current commit
 #               Use this to test the build or re-release without a new tag.
-# -----------------------------------------------------------------------
+# -------------------------------------------------------------------------
 on:
   push:
     tags:
@@ -15,11 +15,12 @@ on:
 
 jobs:
   build:
-    name: Build on Windows
-    runs-on: windows-latest
-
-    permissions:
-      contents: write # Required to create releases and upload assets
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
 
     steps:
       # -----------------------------------------------------------------
@@ -44,11 +45,11 @@ jobs:
       # -----------------------------------------------------------------
       - name: Read version from constants.py
         id: version
-        shell: pwsh
+        shell: bash
         run: |
-          $ver = python -c "from src.core.constants import VERSION; print(VERSION)"
-          "VERSION=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "Building version: $ver"
+          ver=$(python -c "from src.core.constants import VERSION; print(VERSION)")
+          echo "VERSION=$ver" >> "$GITHUB_OUTPUT"
+          echo "Building version: $ver"
 
       # -----------------------------------------------------------------
       # 4. Build the standalone executable via the existing build script
@@ -57,50 +58,118 @@ jobs:
         run: python build_app.py
 
       # -----------------------------------------------------------------
-      # 5. Package the dist folder into the release ZIP
-      #    build_app.py outputs to: dist/VesperFlow_{BUILD_TYPE}/
-      #    For stable releases BUILD_TYPE is empty, so the folder is:
-      #    dist/VesperFlow_/
-      #    We compress everything inside it (not the folder itself) so
-      #    users unzip directly into their working directory.
+      # 5a. Package the dist folder into a release archive (Windows)
+      #     build_app.py outputs to: dist/VesperFlow_{BUILD_TYPE}/
+      #     For stable releases BUILD_TYPE is empty, so the folder is:
+      #     dist/VesperFlow_/
+      #     We compress everything inside it (not the folder itself) so
+      #     users unzip directly into their working directory.
+      #     Output: vesperflow_v{VER}_windows.zip
       # -----------------------------------------------------------------
-      - name: Create ZIP archive
-        id: zip
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        id: package_win
         shell: pwsh
         run: |
-          $ver    = "${{ steps.version.outputs.VERSION }}"
-          $name   = "vesperflow_v${ver}_windows.zip"
-          $folder = Get-ChildItem -Path dist -Directory |
-                    Select-Object -First 1 -ExpandProperty FullName
-
+          $ver = "${{ steps.version.outputs.VERSION }}"
+          $name = "vesperflow_v${ver}_windows.zip"
+          $folder = Get-ChildItem -Path dist -Directory | Select-Object -First 1 -ExpandProperty FullName
           if (-not $folder) {
-            Write-Error "No output folder found in dist/ — build_app.py may have failed."
+            Write-Error "No output folder found in dist/"
             exit 1
           }
-
-          Write-Host "Zipping: $folder  ->  $name"
           Compress-Archive -Path "$folder\*" -DestinationPath $name -Force
-          "ZIP_NAME=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "ASSET_NAME=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # -----------------------------------------------------------------
+      # 5b. Package the dist folder into a release archive (Linux/macOS)
+      #     Same source folder layout as Windows (dist/VesperFlow_/), but
+      #     the archive format differs per platform:
+      #       - Linux: .tar.gz  -> preserves the executable bit, which
+      #                            .zip does not, so users can run the
+      #                            binary immediately after extraction.
+      #       - macOS: .zip     -> matches the typical way .app bundles
+      #                            are distributed; zip preserves the
+      #                            bundle structure that macOS expects.
+      #     Output: vesperflow_v{VER}_linux.tar.gz
+      #             vesperflow_v{VER}_macos.zip
+      # -----------------------------------------------------------------
+      - name: Package (Linux/macOS)
+        if: runner.os != 'Windows'
+        id: package_unix
+        shell: bash
+        run: |
+          ver="${{ steps.version.outputs.VERSION }}"
+          folder=$(find dist -mindepth 1 -maxdepth 1 -type d | head -n 1)
+
+          if [ -z "$folder" ]; then
+            echo "No output folder found in dist/"
+            exit 1
+          fi
+
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            name="vesperflow_v${ver}_linux.tar.gz"
+            tar -czf "$name" -C "$folder" .
+          else
+            name="vesperflow_v${ver}_macos.zip"
+            archive="$GITHUB_WORKSPACE/$name"
+            (cd "$folder" && zip -r "$archive" .)
+          fi
+
+          echo "ASSET_NAME=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-asset
+          path: ${{ runner.os == 'Windows' && steps.package_win.outputs.ASSET_NAME || steps.package_unix.outputs.ASSET_NAME }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Read version from constants.py
+        id: version
+        shell: bash
+        run: |
+          ver=$(python -c "from src.core.constants import VERSION; print(VERSION)")
+          echo "VERSION=$ver" >> "$GITHUB_OUTPUT"
 
       # -----------------------------------------------------------------
       # 6. Resolve the release tag
-      #    - Tag push:        use the pushed tag (e.g. v1.3.0)
+      #    - Tag push:        use the pushed tag (e.g. v1.4.0)
       #    - Manual dispatch: derive from VERSION in constants.py
-      #      Note: if the derived tag (e.g. v1.3.0) does not yet exist,
+      #      Note: if the derived tag (e.g. v1.4.0) does not yet exist,
       #      softprops/action-gh-release will create it at the current commit.
       #      Make sure you are on the correct commit before running manually.
       # -----------------------------------------------------------------
       - name: Resolve release tag
         id: tag
-        shell: pwsh
+        shell: bash
         run: |
-          if ("${{ github.event_name }}" -eq "push") {
-            $tag = "${{ github.ref_name }}"
-          } else {
-            $tag = "v${{ steps.version.outputs.VERSION }}"
-          }
-          "TAG=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "Release tag: $tag"
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "TAG=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "TAG=v${{ steps.version.outputs.VERSION }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
       # -----------------------------------------------------------------
       # 7. Create (or update) the GitHub Release and upload the ZIP
@@ -110,7 +179,7 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.TAG }}
           name: v${{ steps.version.outputs.VERSION }}
-          files: ${{ steps.zip.outputs.ZIP_NAME }}
+          files: artifacts/**/*
           generate_release_notes: true
           make_latest: true
         env:
