@@ -7,7 +7,7 @@ __pycache__/
 *.pyc
 
 # Ignore Data
-data/
+data*/
 *.BIN
 *.bin
 *.DAT

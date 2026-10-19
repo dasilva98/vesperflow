@@ -118,65 +118,77 @@ class ExportManager:
             logger.error(f"Failed to write metadata txt: {e}")
 
     def save_imu_csv(self, dataframe, uid=None):
-        """
-        Saves the IMU DataFrame.
-        """
-        if dataframe is None or dataframe.empty:
-            return False
+            """
+            Saves the IMU DataFrame in chunks so large sessions never lock the GIL
+            or freeze the CLI spinner.
+            """
+            if dataframe is None or dataframe.empty:
+                return False
 
-        output_path = None
-        try:
-            start_dt = dataframe["Time"].iloc[0]
-            end_dt = dataframe["Time"].iloc[-1]
+            output_path = None
+            try:
+                start_dt = dataframe["Time"].iloc[0]
+                end_dt = dataframe["Time"].iloc[-1]
 
-            time_fmt_file = "%Y%m%d_%H%M%S"
-            new_filename = f"{start_dt.strftime(time_fmt_file)}-{end_dt.strftime(time_fmt_file)}_{uid}.csv"
-            output_path = os.path.join(self.structure["imu"], new_filename)
+                time_fmt_file = "%Y%m%d_%H%M%S"
+                new_filename = f"{start_dt.strftime(time_fmt_file)}-{end_dt.strftime(time_fmt_file)}_{uid}.csv"
+                output_path = os.path.join(self.structure["imu"], new_filename)
 
-            df_export = dataframe.copy()
+                col_formats = {
+                    "Acc X [mg]": 3,
+                    "Acc Y [mg]": 3,
+                    "Acc Z [mg]": 3,
+                    "Gyro X [mdps]": 2,
+                    "Gyro Y [mdps]": 2,
+                    "Gyro Z [mdps]": 2,
+                    "Mag X [mGauss]": 1,
+                    "Mag Y [mGauss]": 1,
+                    "Mag Z [mGauss]": 1,
+                    "Temperature [C]": 2,
+                    "Bar Pressure [hPa]": 0,
+                }
 
-            time_str = df_export["Time"].dt.strftime("%d/%m/%Y %H:%M:%S")
-            ms_str = (df_export["Time"].dt.microsecond // 1000).astype(str).str.zfill(3)
-            df_export["Time"] = time_str + "." + ms_str
+                chunk_size = 100_000
+                total_rows = len(dataframe)
 
-            # Format sensor columns to fixed decimal places before writing.
-            # Without this, pandas drops trailing zeros (e.g. -25.010 → -25.01),
-            # making the output look non-uniform even though values are correctly rounded.
-            col_formats = {
-                "Acc X [mg]": 3,
-                "Acc Y [mg]": 3,
-                "Acc Z [mg]": 3,
-                "Gyro X [mdps]": 2,
-                "Gyro Y [mdps]": 2,
-                "Gyro Z [mdps]": 2,
-                "Mag X [mGauss]": 1,
-                "Mag Y [mGauss]": 1,
-                "Mag Z [mGauss]": 1,
-                "Temperature [C]": 2,
-                "Bar Pressure [hPa]": 0,
-            }
-            for col, decimals in col_formats.items():
-                if col in df_export.columns:
-                    df_export[col] = df_export[col].map(
-                        lambda x, d=decimals: f"{x:.{d}f}"
+                for start_idx in range(0, total_rows, chunk_size):
+                    chunk = dataframe.iloc[start_idx : start_idx + chunk_size].copy()
+
+                    time_str = chunk["Time"].dt.strftime("%d/%m/%Y %H:%M:%S")
+                    ms_str = (chunk["Time"].dt.microsecond // 1000).astype(str).str.zfill(3)
+                    chunk["Time"] = time_str + "." + ms_str
+
+                    for col, decimals in col_formats.items():
+                        if col in chunk.columns:
+                            chunk[col] = chunk[col].map(
+                                lambda x, d=decimals: "" if pd.isna(x) else f"{x:.{d}f}"
+                            )
+
+                    if "Millisecond" in chunk.columns:
+                        chunk["Millisecond"] = (
+                            chunk["Millisecond"].astype(int).map(lambda x: f"{x:03d}")
+                        )
+
+                    is_first = start_idx == 0
+                    chunk.to_csv(
+                        output_path,
+                        mode="w" if is_first else "a",
+                        header=is_first,
+                        index=False,
+                        sep=",",
                     )
+                    # Yield the GIL between chunks so the CLI spinner stays smooth
+                    import time
+                    time.sleep(0)
 
-            # Zero-pad the Millisecond column to always show 3 digits (e.g. 2 → 002)
-            if "Millisecond" in df_export.columns:
-                df_export["Millisecond"] = (
-                    df_export["Millisecond"].astype(int).map(lambda x: f"{x:03d}")
+                logger.info(f"Saved IMU CSV: {new_filename}")
+                return True
+
+            except Exception as e:
+                logger.error(
+                    f"Failed to save CSV {output_path if output_path else 'Unknown'}: {e}"
                 )
-
-            df_export.to_csv(output_path, index=False, sep=",")
-
-            logger.info(f"Saved IMU CSV: {new_filename}")
-            return True
-
-        except Exception as e:
-            logger.error(
-                f"Failed to save CSV {output_path if output_path else 'Unknown'}: {e}"
-            )
-            return False
+                return False
 
     def save_aud_wav(self, audio_data, meta):
         """
@@ -198,7 +210,7 @@ class ExportManager:
 
                 wavfile.write(output_path, meta["SampleRate"], audio_data)
 
-                logger.info(f"Saved Audio: {new_filename}")
+                logger.debug(f"Saved Audio: {new_filename}")
                 return True
 
             except Exception as e:
@@ -209,51 +221,56 @@ class ExportManager:
         else:
             return False
 
-    def finalize_geotag_csv(self, decoded_folder, session_id):
-        """
-        Locates the generic 'Track-geoTag.csv' generated by GeoTag.exe,
-        renames it using the Start-End timestamps found inside,
-        and moves it to the main 'data/processed/gps/' folder.
-        """
-        source_csv = os.path.join(decoded_folder, "Track-geoTag.csv")
+    def finalize_gps_csv(self, decoded_folder, session_id):
+            """
+            Locates the decoded GPS CSV ('Track-sdr.csv' from the native SDR solver
+            or 'Track-geoTag.csv' from legacy GeoTag.exe), renames it using the
+            Start-End timestamps found inside, and copies it to 'data/processed/gps/'.
+            """
+            sdr_csv = os.path.join(decoded_folder, "Track-sdr.csv")
+            geotag_csv = os.path.join(decoded_folder, "Track-geoTag.csv")
 
-        if not os.path.exists(source_csv):
-            logger.warning(f"GPS CSV not found at: {source_csv}")
-            return False, 0
-
-        try:
-            df = pd.read_csv(source_csv)
-
-            if df.empty:
-                logger.warning(f"GPS CSV is empty: {source_csv}")
+            if os.path.exists(sdr_csv):
+                source_csv = sdr_csv
+            elif os.path.exists(geotag_csv):
+                source_csv = geotag_csv
+            else:
+                logger.warning(f"Decoded GPS CSV not found in: {decoded_folder}")
                 return False, 0
 
             try:
-                start_str = f"{df.iloc[0]['Date']} {df.iloc[0]['UTC']}"
-                end_str = f"{df.iloc[-1]['Date']} {df.iloc[-1]['UTC']}"
+                df = pd.read_csv(source_csv)
 
-                start_dt = pd.to_datetime(start_str)
-                end_dt = pd.to_datetime(end_str)
+                if df.empty:
+                    logger.warning(f"GPS CSV is empty: {source_csv}")
+                    return False, 0
 
-                fmt = "%Y%m%d-%H%M%S"
-                start_fmt = start_dt.strftime(fmt)
-                end_fmt = end_dt.strftime(fmt)
+                try:
+                    start_str = f"{df.iloc[0]['Date']} {df.iloc[0]['UTC']}"
+                    end_str = f"{df.iloc[-1]['Date']} {df.iloc[-1]['UTC']}"
+
+                    start_dt = pd.to_datetime(start_str)
+                    end_dt = pd.to_datetime(end_str)
+
+                    fmt = "%Y%m%d-%H%M%S"
+                    start_fmt = start_dt.strftime(fmt)
+                    end_fmt = end_dt.strftime(fmt)
+
+                except Exception as e:
+                    logger.warning(
+                        f"Could not parse dates from GPS CSV ({e}). Using generic name."
+                    )
+                    start_fmt = "UnknownStart"
+                    end_fmt = "UnknownEnd"
+
+                new_filename = f"{start_fmt}_{end_fmt}_{session_id}.csv"
+                dest_path = os.path.join(self.structure["gps"], new_filename)
+
+                shutil.copy2(source_csv, dest_path)
+
+                logger.info(f"Finalized GPS CSV: {new_filename}")
+                return True, len(df)
 
             except Exception as e:
-                logger.warning(
-                    f"Could not parse dates from GPS CSV ({e}). Using generic name."
-                )
-                start_fmt = "UnknownStart"
-                end_fmt = "UnknownEnd"
-
-            new_filename = f"{start_fmt}_{end_fmt}_{session_id}.csv"
-            dest_path = os.path.join(self.structure["gps"], new_filename)
-
-            shutil.copy2(source_csv, dest_path)
-
-            logger.info(f"Finalized GPS CSV: {new_filename}")
-            return True, len(df)
-
-        except Exception as e:
-            logger.error(f"Failed to finalize GPS CSV for {session_id}: {e}")
-            return False, 0
+                logger.error(f"Failed to finalize GPS CSV for {session_id}: {e}")
+                return False, 0

@@ -73,9 +73,15 @@ def extract_gps_snapshots(filepath, output_dir):
         if raw_data.size == 0:
             return "EMPTY", "Payload is empty (No GPS fixes)"
 
-        # Word Swap (I/Q Correction) for GeoTag tool
+        # Word Swap (I/Q Correction)
         swapped_data = (raw_data << 16) | (raw_data >> 16)
         swapped_data.astype('<u4').tofile(output_path)
+
+        # Save sub-second millisecond offset to a sidecar index (for Pass-2 clock pinning)
+        if precise_time_str != "Time_Calc_Error":
+            subsec_log = os.path.join(output_dir, "subseconds.csv")
+            with open(subsec_log, "a", encoding="utf-8") as sf:
+                sf.write(f"{filename},0.{precise_time_str.split('.')[-1]}\n")
 
         # Return success with the precise time we calculated
         return "SUCCESS", f"Parsed (Head:{header_size}b, T:{precise_time_str})"
