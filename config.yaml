@@ -1,16 +1,30 @@
-# WildlifeTag Automator - Alpha v0.1 Configuration
+# VesperFlow - Configuration
 
 # Paths to Data Folders
 # Use relative paths (starting with ./) or absolute paths
 # The dot (.) represents "The folder where the .exe is located"
-raw_data_folder: "./data_input"
-processed_folder: "./data_output"
+raw_data_folder: "./data/raw"
+processed_folder: "./data/processed"
+ephemeris_folder: "./data/ephemeris" # Local cache for downloaded NASA/IGS satellite orbits
 
-# External Tools Paths (NOT USED FOR ALPHA v0.1)
-# IMPORTANT: Update these to match your actual installation paths on Windows!
-vesper_app_path: "C:/Program Files/Vesper/VesperApp.exe"
-gps_cli_path: "C:/Program Files/Vesper/CG/GeoTag/GeoTag.exe"
-gps_engine_path: "C:/Program Files/Vesper/CG/GeoTagEngine/GeoTagEngine.exe"
+# GPS Solver Configuration
+gps_solver: "sdr"      # Options: "sdr" (Native cross-platform solver) or "geotag" (Legacy Windows exe)
+gps_region: "europe"   # Options:
+                        #   - Global: "global"
+                        #   - Continents/Macro: "europe", "north_america", "central_america", "south_america",
+                        #                       "africa", "east_africa", "southern_africa", "asia",
+                        #                       "southeast_asia", "oceania", "middle_east", "caribbean", "greenland"
+                        #   - European Sub-Regions: "central_europe", "germany", "uk", "iberia", "france",
+                        #                           "italy", "alps", "scandinavia", "mediterranean"
+                        #   - Countries & Hubs: "usa_conus", "canada", "mexico", "panama", "costa_rica", "amazon",
+                        #                       "brazil", "kenya_tanzania", "south_africa", "madagascar", "india",
+                        #                       "indonesia", "borneo", "japan", "australia", "new_zealand"
+                        #   - Micro-Regions/Islands: "galapagos", "canary_islands", "affenwald"
+                        #   - Or a custom bounding box: [lat_min, lat_max, lon_min, lon_max]
+
+# Legacy External Tools Paths (Only used if gps_solver is set to "geotag")
+gps_cli_path: "./external_tools/CG/GeoTag/GeoTag.exe"
+gps_engine_path: "./external_tools/CG/GeoTagEngine/GeoTagEngine.exe"
 
 # Settings
-log_level: "INFO"  # Options: DEBUG, INFO, WARNING, ERROR
+log_level: "INFO" # Options: DEBUG, INFO, WARNING, ERROR
