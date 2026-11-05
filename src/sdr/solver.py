@@ -5,6 +5,7 @@ import math
 import logging
 from itertools import combinations
 from datetime import datetime
+from typing import Any
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
@@ -181,7 +182,7 @@ def get_visible_constellation_predictions(
     detections: list,
     eph_db: dict,
     tow: float,
-    prelim_sol: dict = None,
+    prelim_sol: dict | None = None,
 ):
     """
     Predicts Doppler shifts (and fractional 1ms code phases if prelim_sol is given)
@@ -251,7 +252,7 @@ def _solve_wls_subset(
     tow: float,
     rx_init: np.ndarray,
     reference_alt: float,
-    pinned_dt_coarse: float = None,
+    pinned_dt_coarse: float | None = None,
     pinned_dt_sigma: float = 0.05,
 ):
     """Core WLS solver for a given subset of satellites."""
@@ -335,6 +336,7 @@ def _solve_wls_subset(
             if best_overall is None or opt.cost < best_overall[0]:
                 best_overall = (opt.cost, sign, dt_c, opt.x)
 
+    assert best_overall is not None
     _, best_sign, best_dtc, best_x = best_overall
     sign = best_sign
 
@@ -383,9 +385,9 @@ def solve_coarse_time_position(
     region="global",
     prior_llh=None,
     reference_alt: float = 250.0,
-    filepath: str = None,
-    prn_dict: dict = None,
-    pinned_dt_coarse: float = None,
+    filepath: str | None = None,
+    prn_dict: dict | None = None,
+    pinned_dt_coarse: float | None = None,
 ):
     rx_init, sv_states_all = estimate_initial_location_from_doppler(
         detections, eph_db, tow, region=region, prior_llh=prior_llh
@@ -514,7 +516,8 @@ def _worker_acquire(filepath: str, prn_dict: dict):
     m = re.search(r"snap\.(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})", fname)
     if not m:
         return None
-    dt = datetime(*map(int, m.groups()))
+    y, mo, d, h, mi, s = (int(g) for g in m.groups())
+    dt = datetime(y, mo, d, h, mi, s)
     detections, _ = acquire_constellation(filepath, prn_dict, total_ms=480, coh_ms=8)
     return (filepath, fname, dt, detections)
 
@@ -526,7 +529,7 @@ def solve_session_directory(
     ephemeris_dir: str = "./data/ephemeris",
     bar_position: int = 0,
     master_pbar=None,
-    max_files: int = None,
+    max_files: int | None = None,
 ) -> tuple:
     """
     Processes .dat snapshots in dat_folder in parallel, optionally runs Pass-2
@@ -601,7 +604,7 @@ def solve_session_directory(
             eph_cache[day_key] = parse_rinex3_gps(rnx_path)
 
     # 3. Pass 1: Solve Navigation Fixes + Assisted Acquisition
-    pass1_records = []
+    pass1_records: list[dict[str, Any]] = []
     active_region = region
     active_alt = 320.0
 
