@@ -275,16 +275,16 @@ def parse_imu_file(filepath):
             return "EMPTY", "No sensor data rows found", None, meta
 
         # --- PART 5b: STARTUP DUPLICATE FILTER ---
-        # The firmware writes the first packet twice at startup (identical pkt_ts
-        # bytes and sensor values). Detect and drop the duplicate if present.
-        if num_samples > 1 and np.array_equal(
-            raw_struct["pkt_ts"][0], raw_struct["pkt_ts"][1]
+        # The firmware writes the first packet twice at startup (identical pkt_ts bytes and sensor values).
+        # Detect and drop the duplicate if present.
+        if num_samples > 1 and np.array_equal(raw_struct["pkt_ts"][0], raw_struct["pkt_ts"][1]
         ):
             raw_struct = raw_struct[1:]
             num_samples -= 1
-            logger.debug(
-                f"Startup duplicate packet removed from {os.path.basename(filepath)}"
-            )
+            meta["Startup_Duplicates_Dropped"] = 1
+            logger.debug(f"Startup duplicate packet removed from {os.path.basename(filepath)}")
+        else:
+            meta["Startup_Duplicates_Dropped"] = 0
 
         # --- PART 6: TIMESTAMP EXTRACTION FROM pkt_ts ---
         # pkt_ts byte map (per packet):
@@ -295,8 +295,7 @@ def parse_imu_file(filepath):
         #   bytes 4-5: subsecond TICK counter (uint16 LE, on 1023-tick scale)
         #
         # The tick counter is the AUTHORITATIVE per-sample timing source.
-        # It counts DOWN from ~1023 to 0 by ~20 ticks per sample at 50Hz,
-        # then wraps back to ~1023 at every second boundary.
+        # It counts DOWN from ~1023 to 0 by ~20 ticks per sample at 50Hz, then wraps back to ~1023 at every second boundary.
         #
         # Time-within-second (ms) = 1000 * (TICK_RESOLUTION - tick) / TICK_DENOM
         #
@@ -409,6 +408,7 @@ def parse_imu_file(filepath):
 
         # 2. Build the mask by checking if ALL dynamically found gyro columns equal -8.75
         hiccup_mask = (df[gyro_cols] == -8.75).all(axis=1)
+        meta["Glitches_Masked"] = int(hiccup_mask.sum())
 
         # 3. Convert the corrupted gyroscope readings to NaN (Not a Number)
         df.loc[hiccup_mask, gyro_cols] = np.nan

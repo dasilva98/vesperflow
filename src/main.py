@@ -6,13 +6,17 @@ from datetime import datetime, timedelta
 from tqdm import tqdm
 
 import pandas as pd
+import numpy as np
 import yaml
 
 from src.core.constants import FULL_APP_NAME
-from src.core.export_manager import ExportManager
-from src.core.file_scanner import scan_raw_files
+from src.core.menu import run_startup_menu
 from src.core.logger import setup_logger, AnimatedTqdm
+
+from src.core.file_scanner import scan_raw_files
+from src.core.export_manager import ExportManager
 from src.core.run_reporter import RunReporter
+
 from src.parsers.audio_parser import parse_audio_file
 from src.parsers.gps_parser import extract_gps_snapshots
 from src.parsers.imu_parser import parse_imu_file
@@ -68,22 +72,25 @@ def main():
         logger.error(f"Failed to load config: {e}")
         return
 
+    # Launch interactive menu (automatically skipped on headless servers/Docker or with --headless)
+    config = run_startup_menu(config)
+
     # Setup Paths & Objects
     raw_folder = config.get("raw_data_folder", "./data/raw")
     processed_folder = config.get("processed_folder", "./data/processed")
 
-    # Instantiate Reporter
-    reporter = RunReporter()
-
-    # Initiate Exporter Manager
+    reporter = RunReporter(
+        report_mode=config.get("report_mode", "verbose"),
+        custom_components=config.get("report_components", None),
+    )
     exporter = ExportManager(processed_folder)
 
     # Scan all files in the input/raw folder
     all_sessions = scan_raw_files(raw_folder)
 
-    # Test limits (Set both to None for full production runs)
-    AUD_TEST_LIMIT = 10
-    GPS_TEST_LIMIT = 50
+    # Read test limits from menu/config (defaults to None for full production runs)
+    AUD_TEST_LIMIT = config.get("AUD_TEST_LIMIT", None)
+    GPS_TEST_LIMIT = config.get("GPS_TEST_LIMIT", None)
 
     solver_mode = config.get("gps_solver", "sdr").strip().lower()
     gps_weight = 2 if solver_mode == "sdr" else 1  # 1 for .BIN unpack + 1 for SDR scan
@@ -152,6 +159,8 @@ def main():
             imu_chunks = []
             session_device_id = None
             last_meta = None
+            imu_glitches = 0
+            imu_dups = 0
 
             if imu_files:
                 logger.info(f"Starting IMU Parser on {len(imu_files)} binary files...")
@@ -179,6 +188,10 @@ def main():
                                 # Safe to assume df is valid and populated here
                                 # Append to imu_chunks list
                                 imu_chunks.append(df)
+
+                                if meta:
+                                    imu_glitches += meta.get("Glitches_Masked", 0)
+                                    imu_dups += meta.get("Startup_Duplicates_Dropped", 0)
 
                                 # Capture DeviceID from the first valid file found
                                 if session_device_id is None and meta:
@@ -212,25 +225,46 @@ def main():
                             imu_bar.set_description_str(
                                 f"💾 Saving IMU CSV ({session_id})", refresh=True
                             )
-                            # Files are already concatenated in sequence order (0M, 1M, 2M...)
-                            # via extract_sequence_index. Do NOT sort by time - consecutive files
-                            # produce identical boundary timestamps and sorting interleaves them.
                             t_start = imu_df["Time"].iloc[0]
                             t_end = imu_df["Time"].iloc[-1]
 
+                            # 1. Update overall session calendar window
                             update_range(t_start, t_end)
 
-                            # Calculate recorded duration (For Data Yield info)
-                            # Duration = Total Samples / Sample Rate
-                            if last_meta and last_meta.get("SampleRate", 0) > 0:
-                                sess_metrics["duration_imu_sec"] = (
-                                    len(imu_df) / last_meta["SampleRate"]
-                                )
-                            else:
-                                # Fallback just in case SampleRate is missing
-                                sess_metrics["duration_imu_sec"] = (
-                                    t_end - t_start
-                                ).total_seconds()
+                            # 2. Calculate True IMU Yield (Duration = Total Samples / Nominal Sample Rate)[cite: 1]
+                            nominal_sr = float(last_meta.get("SampleRate", 50.0)) if last_meta else 50.0
+                            if nominal_sr <= 0:
+                                nominal_sr = 50.0
+                            sess_metrics["duration_imu_sec"] = len(imu_df) / nominal_sr
+
+                            # 3. Calculate sleep-gap-free Effective Sample Rate (Hz)
+                            time_diffs = imu_df["Time"].diff().dt.total_seconds()
+                            active_sec = float(time_diffs[(time_diffs > 0) & (time_diffs <= 1.0)].sum())
+                            eff_hz = (len(imu_df) - 1) / active_sec if active_sec > 0 else nominal_sr
+
+                            # 4. Populate IMU & Environmental Health Analytics
+                            temp_col = imu_df["Temperature [C]"]
+                            pres_col = imu_df["Bar Pressure [hPa]"]
+                            has_env = bool(last_meta and (last_meta.get("Bitmask", 0) & 0x08)) or (
+                                temp_col.abs().max() > 0
+                            )
+
+                            sess_metrics["imu_analytics"] = {
+                                "total_samples": len(imu_df),
+                                "effective_hz": eff_hz,
+                                "temp_range_str": (
+                                    f"{temp_col.min():.1f} to {temp_col.max():.1f}"
+                                    if has_env
+                                    else "N/A (Off)"
+                                ),
+                                "pres_range_str": (
+                                    f"{pres_col.min():.0f} to {pres_col.max():.0f}"
+                                    if has_env
+                                    else "N/A (Off)"
+                                ),
+                                "glitches_masked": imu_glitches,
+                                "dups_dropped": imu_dups,
+                            }
 
                             if last_meta:
                                 last_meta["Start_Time"] = t_start
@@ -253,6 +287,15 @@ def main():
                 aud_files = aud_files[:AUD_TEST_LIMIT]
 
             sess_metrics["files_total"] += len(aud_files)
+
+            # Initialize counters BEFORE the loop
+            aud_total_samples = 0
+            aud_clipped_samples = 0
+            aud_sum_sq = 0.0
+            aud_max_peak = 0.0
+            aud_dead_files = 0
+            aud_bouts = 0
+            prev_aud_end = None
 
             if aud_files:
                 logger.info(f"Starting Audio Parser on {len(aud_files)} binary files...")
@@ -283,6 +326,7 @@ def main():
                                 sess_metrics["id"] = session_device_id
 
                             if meta and audio_data is not None:
+
                                 duration = len(audio_data) / meta["SampleRate"]
                                 end_time = meta["Start_Time"] + timedelta(seconds=duration)
 
@@ -290,10 +334,29 @@ def main():
 
                                 update_range(meta["Start_Time"], end_time)
 
+                                # Bout detection (gap > 5 minutes indicates a new recording bout)
+                                if prev_aud_end is None or (meta["Start_Time"] - prev_aud_end).total_seconds() > 300:
+                                    aud_bouts += 1
+                                prev_aud_end = end_time
+
+                                # Bioacoustic signal integrity stats
+                                arr_f = audio_data.astype(np.float64)
+                                n_s = len(arr_f)
+                                aud_total_samples += n_s
+                                aud_clipped_samples += int(np.sum(np.abs(arr_f) >= 32760))
+                                file_sq = float(np.sum(arr_f ** 2))
+                                aud_sum_sq += file_sq
+                                aud_max_peak = max(aud_max_peak, float(np.max(np.abs(arr_f))) if n_s > 0 else 0.0)
+
+                                file_rms = np.sqrt(file_sq / max(n_s, 1))
+                                if 20.0 * np.log10(max(file_rms / 32768.0, 1e-9)) < -75.0:
+                                    aud_dead_files += 1
+
                                 exporter.save_aud_wav(audio_data, meta)
                                 exporter.save_session_metadata(
                                     meta, end_time=end_time, time_stamps=timestamps
                                 )
+
 
                         # Log result in the reporter
                         reporter.log_file_result("aud", status, filepath, msg)
@@ -304,9 +367,22 @@ def main():
                         )
                     finally:
                         master_pbar.update(1)
+
+                # Finalize audio analytics after the loop completes
+                if sess_metrics["aud_ok"] > 0 and aud_total_samples > 0:
+                    global_rms = np.sqrt(aud_sum_sq / aud_total_samples)
+                    sess_metrics["audio_analytics"] = {
+                        "bouts": aud_bouts,
+                        "mean_file_sec": sess_metrics["aud_duration"] / sess_metrics["aud_ok"],
+                        "mean_dbfs": 20.0 * np.log10(max(global_rms / 32768.0, 1e-9)),
+                        "peak_dbfs": 20.0 * np.log10(max(aud_max_peak / 32768.0, 1e-9)),
+                        "clipping_pct": (aud_clipped_samples / aud_total_samples) * 100.0,
+                        "dead_mic_files": aud_dead_files,
+                    }
                 logger.info(f"Saved {sess_metrics['aud_ok']} Audio .WAV files for {session_id}")
             else:
                 logger.warning(f"No audio binary files found in {session_id}")
+
 
             # ==========================================
             # 3. GPS PROCESSING
@@ -463,12 +539,26 @@ def main():
                         )
 
                     if gps_success:
-                        # Export the decoded GPS output
                         success, count = exporter.finalize_gps_csv(
                             abs_decode_dir, final_id
                         )
                         if success:
                             sess_metrics["gps_fixes"] = count
+                            track_csv = os.path.join(abs_decode_dir, "Track-sdr.csv")
+                            if os.path.exists(track_csv):
+                                gdf = pd.read_csv(track_csv)
+                                if not gdf.empty:
+                                    sv_col = gdf["SVs in Use"] if "SVs in Use" in gdf.columns else gdf["Satellites"]
+                                    cn0_col = gdf["SNR Avg [dB]"] if "SNR Avg [dB]" in gdf.columns else gdf["Max C/N0 [dB-Hz]"]
+                                    sess_metrics["gps_analytics"] = {
+                                        "fixes_3d": int((sv_col >= 5).sum()),
+                                        "fixes_2d": int((sv_col == 4).sum()),
+                                        "mean_cn0": float(pd.to_numeric(cn0_col, errors="coerce").mean()),
+                                        "med_hdop": float(pd.to_numeric(gdf.get("HDOP", pd.Series([0.0])), errors="coerce").median()),
+                                        "med_rms": float(pd.to_numeric(gdf.get("Pseudorange RMS [m]", pd.Series([0.0])), errors="coerce").median()),
+                                        "med_alt": float(pd.to_numeric(gdf["Altitude [m]"], errors="coerce").median()),
+                                        "med_clock_s": float(pd.to_numeric(gdf.get("Clock Offset [s]", pd.Series([0.0])), errors="coerce").median()),
+                                    }
                     else:
                         err_msg = f" [{session_device_id}]-> {gps_msg}"
                         logger.error(err_msg)

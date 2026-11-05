@@ -1,272 +1,313 @@
 import os
 from datetime import datetime
+from typing import Any
+
 from src.core.constants import FULL_APP_NAME
+
+DEFAULT_REPORT_COMPONENTS = {
+    "raw_stats": True,
+    "sessions_inventory": True,
+    "data_yield": True,
+    "gps_analytics": True,
+    "imu_analytics": True,
+    "audio_analytics": True,
+    "quality_control": True,
+}
+
 
 class RunReporter:
     """
     Manages execution statistics and generates the final Processing Report.
-    Functions as the 'Single Source of Truth' for run metrics.
+    Supports 'compact', 'verbose', and 'custom' component-level toggling.
     """
-    def __init__(self):
-        # Capture start time
+
+    def __init__(self, report_mode="verbose", custom_components=None):
         self.start_time = datetime.now()
-        # Initialize zeroed stats structure
-        self.stats = {
+        self.report_mode = (report_mode or "verbose").strip().lower()
+        self.components = self._resolve_components(self.report_mode, custom_components)
+
+        self.stats: dict[str, Any] = {
             "total": 0,
-
-            # IMU
             "total_imu": 0, "success_imu": 0, "warn_imu": 0, "failed_imu": 0,
-
-            # Audio
             "total_aud": 0, "success_aud": 0, "warn_aud": 0, "failed_aud": 0,
-
-            # GPS
             "total_gps": 0, "success_gps": 0, "warn_gps": 0, "failed_gps": 0,
-
-            # Yield Metrics
-            "duration_imu_sec": 0,
-            "duration_aud_sec": 0,
+            "duration_imu_sec": 0.0,
+            "duration_aud_sec": 0.0,
             "gps_fixes": 0,
-
-            # Lists
             "sessions": [],
-            "errors": []
+            "errors": [],
         }
 
-    def log_file_result(self, sensor_type, status, filepath, msg=None):
-        """
-        Updates counters for a specific file and logs errors if needed.
-        sensor_type: 'imu', 'aud', or 'gps'
-        status: 'SUCCESS', 'EMPTY', or 'FAIL'
-        """
-        s_key = sensor_type.lower() # e.g., 'imu'
+    @staticmethod
+    def _resolve_components(mode: str, custom: dict | None = None) -> dict:
+        if custom == None:
+            custom = {}
+        if mode == "compact":
+            return {
+                "raw_stats": True,
+                "sessions_inventory": True,
+                "data_yield": True,
+                "gps_analytics": False,
+                "imu_analytics": False,
+                "audio_analytics": False,
+                "quality_control": True,
+            }
+        if mode == "custom" and isinstance(custom, dict):
+            return {k: bool(custom.get(k, v)) for k, v in DEFAULT_REPORT_COMPONENTS.items()}
+        return dict(DEFAULT_REPORT_COMPONENTS)
 
-        # 1. Increment Total
+    def log_file_result(self, sensor_type, status, filepath, msg=None):
+        s_key = sensor_type.lower()
         self.stats[f"total_{s_key}"] += 1
         self.stats["total"] += 1
 
-        # 2. Increment Specific Status
         if status == "SUCCESS":
             self.stats[f"success_{s_key}"] += 1
-
         elif status == "EMPTY":
             self.stats[f"warn_{s_key}"] += 1
-            self.stats['errors'].append({
+            self.stats["errors"].append({
                 "type": "WARN",
                 "file": filepath,
-                "reason": msg or "File Empty"
+                "reason": msg or "File Empty",
             })
-
-        else: # FAIL or anything else
+        else:
             self.stats[f"failed_{s_key}"] += 1
-            self.stats['errors'].append({
+            self.stats["errors"].append({
                 "type": "CRITICAL",
                 "file": filepath,
-                "reason": msg or "Processing Failed"
+                "reason": msg or "Processing Failed",
             })
 
     def add_session(self, session_metrics):
-        """Adds a completed session inventory to the report."""
-        self.stats['sessions'].append(session_metrics)
-
-        # Aggregate Yields (Safe get to avoid errors if keys missing)
+        self.stats["sessions"].append(session_metrics)
         self.stats["gps_fixes"] += session_metrics.get("gps_fixes", 0)
-
-        # Add IMU duration and Audio duration the the global stats
-        self.stats["duration_imu_sec"] += session_metrics.get("duration_imu_sec", 0)
-        self.stats["duration_aud_sec"] += session_metrics.get("aud_duration", 0)
-
-        # If your session_metrics has explicit keys, sum them here:
-        if "aud_duration" in session_metrics:
-            self.stats["duration_aud_sec"] += session_metrics["aud_duration"]
-        # Add IMU duration logic if you track it per session in main.py
+        self.stats["duration_imu_sec"] += session_metrics.get("duration_imu_sec", 0.0)
+        self.stats["duration_aud_sec"] += session_metrics.get("aud_duration", 0.0)
 
     def log_external_error(self, reason):
-        """Logs a generic or external tool error (like GeoTag missing)."""
-        self.stats['errors'].append({
+        self.stats["errors"].append({
             "type": "CRITICAL",
             "file": "External Tool",
-            "reason": reason
+            "reason": reason,
         })
 
-    def save_report(self, processed_folder, logger):
-        """
-        Compiles and saves the formatted text report.
-        """
-        lines = []
-
-        # --- HEADER ---
-        lines.append("="*100)
-        title = f"{FULL_APP_NAME.upper()} - PROCESSING REPORT"
-        lines.append(f"{title:^100}")
-        lines.append("="*100)
-
-        # Calculate duration
-        duration = datetime.now() - self.start_time
-        s = int(duration.total_seconds())
-
-        # Calculate hours, minutes, seconds
-        m, s = divmod(s, 60)
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        m, s = divmod(int(round(seconds)), 60)
         h, m = divmod(m, 60)
+        return f"{h}h {m}m {s}s"
 
-        # Format: 01h04m36s or 22m06s
-        time_str = f"{h:02}h{m:02}m{s:02}s" if h else f"{m:02}m{s:02}s"
+    def save_report(self, processed_folder, logger):
+        end_time = datetime.now()
+        run_secs = (end_time - self.start_time).total_seconds()
+        rm, rs = divmod(int(run_secs), 60)
+        run_str = f"{rm:02d}m{rs:02d}s"
+        date_str = end_time.strftime("%Y-%m-%d %H:%M:%S")
 
-        date_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-        # "Date: 2026-02-02 06:57:10  |  Total Files Found: 6462  |  Run Time: 22m06s"
-        header_info = f"Date: {date_str}  |  Total Files Found: {self.stats['total']}  |  Run Time: {time_str}"
-        lines.append(f"{header_info:^100}") # Center it for extra style, or remove :^100 to left align
+        lines = []
+        lines.append("=" * 100)
+        title = f"{FULL_APP_NAME.upper()} - PROCESSING REPORT ({self.report_mode.upper()})"
+        lines.append(f"{title:^100}")
+        lines.append("=" * 100)
+        header_meta = f"Date: {date_str}  |  Total Files Found: {self.stats['total']}  |  Run Time: {run_str}"
+        lines.append(f"{header_meta:^100}")
         lines.append("")
 
-        # --- SECTION 1: RAW DATA STATISTICS ---
-        lines.append("RAW DATA STATISTICS:")
-        lines.append("-" * 59)
-        lines.append(f"| {'SENSOR':<8} | {'TOTAL':<6} | {'OK':<6} | {'WARN':<6} | {'FAIL':<6} | {'RATE (%)':<8} |")
-        lines.append("-" * 59)
+        # ------------------------------------------------------------------
+        # 1. RAW DATA STATISTICS
+        # ------------------------------------------------------------------
+        if self.components.get("raw_stats", True):
+            lines.append("RAW DATA STATISTICS:")
+            lines.append("-" * 59)
+            lines.append("| SENSOR   | TOTAL  | OK     | WARN   | FAIL   | RATE (%) |")
+            lines.append("-" * 59)
+            for label, key in [("IMU", "imu"), ("AUDIO", "aud"), ("GPS", "gps")]:
+                tot = self.stats[f"total_{key}"]
+                ok = self.stats[f"success_{key}"]
+                warn = self.stats[f"warn_{key}"]
+                fail = self.stats[f"failed_{key}"]
+                rate = (ok / tot * 100.0) if tot > 0 else 0.0
+                lines.append(
+                    f"| {label:<8} | {tot:<6} | {ok:<6} | {warn:<6} | {fail:<6} | {rate:>6.1f}%  |"
+                )
+            lines.append("-" * 59)
+            tot_all = self.stats["total"]
+            ok_all = self.stats["success_imu"] + self.stats["success_aud"] + self.stats["success_gps"]
+            warn_all = self.stats["warn_imu"] + self.stats["warn_aud"] + self.stats["warn_gps"]
+            fail_all = self.stats["failed_imu"] + self.stats["failed_aud"] + self.stats["failed_gps"]
+            rate_all = (ok_all / tot_all * 100.0) if tot_all > 0 else 0.0
+            lines.append(
+                f"| {'ALL':<8} | {tot_all:<6} | {ok_all:<6} | {warn_all:<6} | {fail_all:<6} | {rate_all:>6.1f}%  |"
+            )
+            lines.append("-" * 59)
+            lines.append("")
 
-        def calc_pct(num, den):
-            return f"{(num/den)*100:.1f}%" if den > 0 else "0.0%"
+        # ------------------------------------------------------------------
+        # 2. SESSIONS INVENTORY & METRICS
+        # ------------------------------------------------------------------
+        if self.components.get("sessions_inventory", True) and self.stats["sessions"]:
+            lines.append("SESSIONS INVENTORY & METRICS:")
+            lines.append("-" * 105)
+            lines.append(
+                "| DEVICE ID  | WINDOW (Start -> End)                  | IMU (h) | AUD (h) | GPS (Fix/Try) | I/A/G       |"
+            )
+            lines.append("-" * 105)
+            for s in self.stats["sessions"]:
+                dev_id = str(s.get("id", "Unknown"))[:10]
+                st, et = s.get("start_time"), s.get("end_time")
+                if st and et:
+                    win_str = f"{st.strftime('%Y-%m-%d %H:%M')} -> {et.strftime('%Y-%m-%d %H:%M')}"
+                else:
+                    win_str = "N/A"
+                imu_h = s.get("duration_imu_sec", 0.0) / 3600.0
+                aud_h = s.get("aud_duration", 0.0) / 3600.0
+                gps_str = f"{s.get('gps_fixes', 0)}/{s.get('gps_attempts', 0)}"
+                iag_str = f"{s.get('imu_ok', 0)}/{s.get('aud_ok', 0)}/{s.get('gps_ok', 0)}"
+                lines.append(
+                    f"| {dev_id:<10} | {win_str:<38} | {imu_h:<7.1f} | {aud_h:<7.1f} | {gps_str:<13} | {iag_str:<11} |"
+                )
+            lines.append("-" * 105)
+            lines.append("")
 
-        # Define rows
-        rows = [
-            ("IMU", self.stats['total_imu'], self.stats['success_imu'], self.stats['warn_imu'], self.stats['failed_imu']),
-            ("AUDIO", self.stats['total_aud'], self.stats['success_aud'], self.stats['warn_aud'], self.stats['failed_aud']),
-            ("GPS", self.stats['total_gps'], self.stats['success_gps'], self.stats['warn_gps'], self.stats['failed_gps']),
-        ]
+        # ------------------------------------------------------------------
+        # 3. TOTAL DATA YIELD
+        # ------------------------------------------------------------------
+        if self.components.get("data_yield", True):
+            lines.append("TOTAL DATA YIELD:")
+            lines.append(f"   > Total IMU Duration:   {self._fmt_duration(self.stats['duration_imu_sec'])}")
+            lines.append(f"   > Total Audio Duration: {self._fmt_duration(self.stats['duration_aud_sec'])}")
+            lines.append(f"   > Total GPS Fixes:      {self.stats['gps_fixes']} valid coordinates")
+            lines.append("")
 
-        for label, tot, ok, warn, fail in rows:
-            pct = calc_pct(ok, tot)
-            lines.append(f"| {label:<8} | {tot:<6} | {ok:<6} | {warn:<6} | {fail:<6} | {pct:<8} |")
+        # ------------------------------------------------------------------
+        # 4. GPS / GNSS SIGNAL & TRAJECTORY ANALYTICS
+        # ------------------------------------------------------------------
+        if self.components.get("gps_analytics", True) and any(s.get("gps_fixes", 0) > 0 for s in self.stats["sessions"]):
+            lines.append("GPS / GNSS SIGNAL & TRAJECTORY ANALYTICS:")
+            lines.append("-" * 108)
+            lines.append(
+                "| DEVICE ID  | YIELD (%) | 3D / 2D FIXES | MEAN C/N0  | MED HDOP | MED RMS [m] | ALTITUDE [m] | RTC OFFSET |"
+            )
+            lines.append("-" * 108)
+            for s in self.stats["sessions"]:
+                dev_id = str(s.get("id", "Unknown"))[:10]
+                tries = s.get("gps_attempts", 0)
+                fixes = s.get("gps_fixes", 0)
+                yield_pct = (fixes / tries * 100.0) if tries > 0 else 0.0
+                g_stat = s.get("gps_analytics", {})
+                if fixes > 0 and g_stat:
+                    f3d = g_stat.get("fixes_3d", 0)
+                    f2d = g_stat.get("fixes_2d", 0)
+                    fix_split = f"{f3d} / {f2d}"
+                    cn0_str = f"{g_stat.get('mean_cn0', 0.0):.1f} dB"
+                    hdop_str = f"{g_stat.get('med_hdop', 0.0):.1f}"
+                    rms_str = f"{g_stat.get('med_rms', 0.0):.1f} m"
+                    alt_str = f"{g_stat.get('med_alt', 0.0):.0f} m"
+                    clk_str = f"{g_stat.get('med_clock_s', 0.0):+.2f} s"
+                else:
+                    fix_split, cn0_str, hdop_str, rms_str, alt_str, clk_str = "0 / 0", "N/A", "N/A", "N/A", "N/A", "N/A"
+                lines.append(
+                    f"| {dev_id:<10} | {yield_pct:>7.1f}%  | {fix_split:<13} | {cn0_str:<10} | {hdop_str:<8} | {rms_str:<11} | {alt_str:<12} | {clk_str:<10} |"
+                )
+            lines.append("-" * 108)
+            lines.append("")
 
-        lines.append("-" * 59)
-
-        # TOTALS ROW
-        all_tot = sum(r[1] for r in rows)
-        all_ok = sum(r[2] for r in rows)
-        all_warn = sum(r[3] for r in rows)
-        all_fail = sum(r[4] for r in rows)
-        all_pct = calc_pct(all_ok, all_tot)
-
-        lines.append(f"| {'ALL':<8} | {all_tot:<6} | {all_ok:<6} | {all_warn:<6} | {all_fail:<6} | {all_pct:<8} |")
-        lines.append("-" * 59)
-        lines.append(" ")
-
-        # --- SECTION 2: SESSIONS INVENTORY & METRICS ---
-        lines.append("SESSIONS INVENTORY & METRICS:")
-        lines.append("-" * 100)
-
-        # Expanded WINDOW to 38 to comfortably fit the full date and time format
-        header = f"| {'DEVICE ID':<10} | {'WINDOW (Start -> End)':<38} | {'AUD (h)':<7} | {'GPS (Fix/Try)':<13} | {'FILES (I/A/G)':<16} |"
-        lines.append(header)
-        lines.append("-" * 100)
-
-        for sess in self.stats['sessions']:
-            if sess.get('start_time') and sess.get('end_time'):
-                # Full 4-digit year, month, day, hour, and minute
-                t1 = sess['start_time'].strftime("%Y-%m-%d %H:%M")
-                t2 = sess['end_time'].strftime("%Y-%m-%d %H:%M")
-                window_str = f"{t1} -> {t2}"
-            else:
-                window_str = "No Data"
-
-            aud_hrs = f"{sess.get('aud_duration', 0)/3600:.1f}"
-            gps_ratio = f"{sess.get('gps_fixes',0)}/{sess.get('gps_attempts',0)}"
-            files_breakdown = f"{sess.get('imu_ok',0)}/{sess.get('aud_ok',0)}/{sess.get('gps_ok',0)}"
-
-            row = f"| {sess['id']:<10} | {window_str:<38} | {aud_hrs:<7} | {gps_ratio:<13} | {files_breakdown:<16} |"
-            lines.append(row)
-
-        lines.append("-" * 100)
-        lines.append("")
-
-        # --- SECTION 3: TOTAL DATA YIELD ---
-        lines.append("TOTAL DATA YIELD:")
-        def fmt_time(seconds):
-            m, s = divmod(seconds, 60)
-            h, m = divmod(m, 60)
-            return f"{int(h)}h {int(m)}m {int(s)}s"
-
-        lines.append(f"   > Total IMU Duration:   {fmt_time(self.stats['duration_imu_sec'])}")
-        lines.append(f"   > Total Audio Duration: {fmt_time(self.stats['duration_aud_sec'])}")
-        lines.append(f"   > Total GPS Fixes:      {self.stats['gps_fixes']} valid coordinates")
-        lines.append("="*100)
-
-        # --- SECTION 4: ERRORS & WARNINGS ---
-        errors = [e for e in self.stats['errors'] if e.get('type') == 'CRITICAL']
-        if errors:
-            lines.append(f"{'[X] CRITICAL FAILURES (Action Required)':^100}")
+        # ------------------------------------------------------------------
+        # 5. IMU & ENVIRONMENTAL HEALTH ANALYTICS
+        # ------------------------------------------------------------------
+        if self.components.get("imu_analytics", True) and any(s.get("imu_ok", 0) > 0 for s in self.stats["sessions"]):
+            lines.append("IMU & ENVIRONMENTAL HEALTH ANALYTICS:")
             lines.append("-" * 100)
-            has_geotag = False
-            for err in errors:
-                lines.append(f"   {err['reason']}")
-                if 'file' in err and err['file'] != "External Tool":
-                     lines.append(f"      File: {err['file']}")
-                if "GeoTag" in err['reason']: has_geotag = True
-
-            if has_geotag:
-                lines.append("=> Ensure you are running this tool on Windows as GeoTag.exe is only compatible with Windows.")
-                lines.append("=> Ensure GeoTag.exe and its sidecar files are in the correct folder (configurable in 'config.yaml').")
-                lines.append("=> Default target folder location is 'external_tools/'")
-            lines.append("="*100)
-
-        warnings = [e for e in self.stats['errors'] if e.get('type') == 'WARN']
-        if warnings:
-            if not errors: lines.append("="*100)
-            lines.append("[!] WARNINGS (Empty Files - No Data Recorded)")
+            lines.append(
+                "| DEVICE ID  | SAMPLES    | EFF. RATE   | TEMP RANGE [C]    | PRESSURE [hPa]    | GLITCHES MASKED  |"
+            )
             lines.append("-" * 100)
-            for w in warnings[:15]:
-                lines.append(f"   {os.path.basename(w['file'])}: {w['reason']}")
-            if len(warnings) > 15: lines.append(f"   ... and {len(warnings)-15} more.")
-            lines.append("="*100)
+            for s in self.stats["sessions"]:
+                dev_id = str(s.get("id", "Unknown"))[:10]
+                i_stat = s.get("imu_analytics", {})
+                if s.get("imu_ok", 0) > 0 and i_stat:
+                    n_samp = f"{i_stat.get('total_samples', 0):,}"
+                    eff_hz = f"{i_stat.get('effective_hz', 0.0):.2f} Hz"
+                    t_range = i_stat.get("temp_range_str", "N/A (Off)")
+                    p_range = i_stat.get("pres_range_str", "N/A (Off)")
+                    glitches = f"{i_stat.get('glitches_masked', 0)} gyro / {i_stat.get('dups_dropped', 0)} dup"
+                else:
+                    n_samp, eff_hz, t_range, p_range, glitches = "0", "N/A", "N/A", "N/A", "0"
+                lines.append(
+                    f"| {dev_id:<10} | {n_samp:<10} | {eff_hz:<11} | {t_range:<17} | {p_range:<17} | {glitches:<16} |"
+                )
+            lines.append("-" * 100)
+            lines.append("")
+
+        # ------------------------------------------------------------------
+        # 6. AUDIO BIOACOUSTICS & SIGNAL INTEGRITY
+        # ------------------------------------------------------------------
+        if self.components.get("audio_analytics", True) and any(s.get("aud_ok", 0) > 0 for s in self.stats["sessions"]):
+            lines.append("AUDIO BIOACOUSTICS & SIGNAL INTEGRITY:")
+            lines.append("-" * 100)
+            lines.append(
+                "| DEVICE ID  | BOUTS | MEAN FILE | MEAN LEVEL   | PEAK LEVEL   | CLIPPING (%)   | DEAD-MIC FILES   |"
+            )
+            lines.append("-" * 100)
+            for s in self.stats["sessions"]:
+                dev_id = str(s.get("id", "Unknown"))[:10]
+                a_stat = s.get("audio_analytics", {})
+                if s.get("aud_ok", 0) > 0 and a_stat:
+                    bouts = str(a_stat.get("bouts", 1))
+                    mean_len = f"{a_stat.get('mean_file_sec', 0.0):.1f} s"
+                    rms_db = f"{a_stat.get('mean_dbfs', -99.0):.1f} dBFS"
+                    peak_db = f"{a_stat.get('peak_dbfs', -99.0):.1f} dBFS"
+                    clip_pct = f"{a_stat.get('clipping_pct', 0.0):.4f}%"
+                    dead_cnt = f"{a_stat.get('dead_mic_files', 0)} files"
+                else:
+                    bouts, mean_len, rms_db, peak_db, clip_pct, dead_cnt = "0", "N/A", "N/A", "N/A", "0.0000%", "0 files"
+                lines.append(
+                    f"| {dev_id:<10} | {bouts:<5} | {mean_len:<9} | {rms_db:<12} | {peak_db:<12} | {clip_pct:<14} | {dead_cnt:<16} |"
+                )
+            lines.append("-" * 100)
+            lines.append("")
+
+        lines.append("=" * 100)
+
+        # ------------------------------------------------------------------
+        # 7. QUALITY CONTROL (CRITICAL FAILURES & WARNINGS)
+        # ------------------------------------------------------------------
+        if self.components.get("quality_control", True):
+            errors = [e for e in self.stats["errors"] if e.get("type") == "CRITICAL"]
+            if errors:
+                lines.append(f"{'[X] CRITICAL FAILURES (Action Required)':^100}")
+                lines.append("-" * 100)
+                for err in errors:
+                    lines.append(f"   {err['reason']}")
+                    if "file" in err and err["file"] != "External Tool":
+                        lines.append(f"      File: {err['file']}")
+                lines.append("=" * 100)
+
+            warnings = [e for e in self.stats["errors"] if e.get("type") == "WARN"]
+            if warnings:
+                lines.append(f"{'[!] WARNINGS (Empty or Interrupted Files)':^100}")
+                lines.append("-" * 100)
+                for w in warnings[:25]:
+                    lines.append(f"   {w['reason']} -> {w.get('file', '')}")
+                if len(warnings) > 25:
+                    lines.append(f"   ... and {len(warnings) - 25} additional warnings.")
+                lines.append("=" * 100)
 
         lines.append("END OF REPORT")
 
-        # --- 1. CONSOLE OUTPUT (Smart Logging) ---
-        import logging # Ensure available locally if needed
-        current_level = logging.INFO
+        # Write to file and log to console
+        report_dir = os.path.join(processed_folder, "report_cards")
+        os.makedirs(report_dir, exist_ok=True)
+        report_filename = f"Report_{end_time.strftime('%Y%m%d_%H%M%S')}.txt"
+        report_path = os.path.join(report_dir, report_filename)
 
-        # Define 'safe' limit for console, but ALWAYS print errors
-        console_limit = 40
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
 
-        for i, line in enumerate(lines):
-            # Dynamic Level Switching
+        for line in lines:
             if "[X] CRITICAL FAILURES" in line:
-                current_level = logging.ERROR
-            elif "[!] WARNINGS" in line:
-                current_level = logging.WARNING
-            elif "END OF REPORT" in line:
-                current_level = logging.INFO
-
-            # Smart Truncation:
-            # If we are in INFO mode and passed the limit, skip until we hit a warning/error
-            if i > console_limit and current_level == logging.INFO:
-                if i == console_limit + 1:
-                    logger.info("... (Middle of report truncated for console) ...")
-                continue
-
-            # Log with the correct color/level
-            if current_level == logging.ERROR:
                 logger.error(line)
-            elif current_level == logging.WARNING:
-                logger.warning(line)
             else:
                 logger.info(line)
 
-        # --- 2. FILE SAVE ---
-        reports_dir = os.path.join(processed_folder, "report_cards")
-        os.makedirs(reports_dir, exist_ok=True)
-        filename = f"Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        report_path = os.path.join(reports_dir, filename)
-
-        # normalize the path
-        display_path = os.path.normpath(report_path)
-
-        try:
-            with open(report_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines))
-            logger.info(f"[Report] Saved to: {display_path}")
-            return report_path
-        except Exception as e:
-            logger.error(f"Failed to write summary report file: {e}")
-            return None
+        logger.info(f"[Report] Saved to: {report_path}")

@@ -12,6 +12,7 @@ from scipy.optimize import least_squares
 from tqdm import tqdm
 
 from src.core.constants import REGION_PRESETS
+from src.core.menu import get_all_regions
 from src.sdr.acquisition import (
     F_L1, generate_native_prns, acquire_constellation, acquire_ephemeris_aided, USE_CODE_PHASE_AIDING
 )
@@ -85,6 +86,7 @@ def calc_el_az(rx_ecef: np.ndarray, sv_ecef: np.ndarray):
 def estimate_initial_location_from_doppler(
     detections: list, eph_db: dict, tow: float, region="global", prior_llh=None
 ):
+
     sv_states = []
     for d in detections:
         if d["prn"] not in eph_db:
@@ -97,10 +99,10 @@ def estimate_initial_location_from_doppler(
         return llh_to_ecef(*prior_llh), sv_states
 
     if isinstance(region, str):
+        all_presets = get_all_regions()
         key = region.strip().lower().replace(" ", "_")
-        lat_min, lat_max, lon_min, lon_max, step = REGION_PRESETS.get(
-            key, REGION_PRESETS["global"]
-        )
+        lat_min, lat_max, lon_min, lon_max, step = all_presets.get(key, all_presets["global"])
+
     elif isinstance(region, (tuple, list)) and len(region) == 4:
         lat_min, lat_max, lon_min, lon_max = region
         step = max(0.25, min((lat_max - lat_min), (lon_max - lon_min)) / 20.0)
