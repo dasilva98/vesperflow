@@ -58,6 +58,8 @@ args = [
     "--hidden-import=scipy.stats",
     "--hidden-import=scipy.special",
     "--hidden-import=scipy.spatial.transform._rotation_groups",
+    "--hidden-import=questionary",
+    "--hidden-import=prompt_toolkit",
     "--clean",
     "--noconfirm",
 ]
@@ -71,12 +73,7 @@ print(f"\n>>> Organizing Output into '{FOLDER_NAME}'...")
 dist_root = "dist"
 final_folder_path = os.path.join(dist_root, FOLDER_NAME)
 
-# On Linux/macOS, PyInstaller's onefile binary has no extension, so its name
-# exactly matches FOLDER_NAME (when BUILD_TYPE is empty). That means the binary
-# and the folder we are about to create collide on the same path. On Windows
-# the binary is "*.exe", so no collision occurs and this block is a no-op.
-# When a collision is detected, move the binary aside; it is restored inside
-# the folder in section B below.
+# Handle Linux/macOS binary-vs-folder name collision
 binary_collision_path = None
 if os.path.isfile(final_folder_path):
     binary_collision_path = final_folder_path + ".tmp_binary"
@@ -84,11 +81,11 @@ if os.path.isfile(final_folder_path):
         os.remove(binary_collision_path)
     os.rename(final_folder_path, binary_collision_path)
 
-# A. Create the Root Folder Structure
+# A. Create the Root Folder Structure (Matching config.yaml paths)
 os.makedirs(final_folder_path, exist_ok=True)
 os.makedirs(os.path.join(final_folder_path, "logs"), exist_ok=True)
-os.makedirs(os.path.join(final_folder_path, "data_input"), exist_ok=True)
-os.makedirs(os.path.join(final_folder_path, "data_output"), exist_ok=True)
+os.makedirs(os.path.join(final_folder_path, "data", "raw"), exist_ok=True)
+os.makedirs(os.path.join(final_folder_path, "data", "processed"), exist_ok=True)
 os.makedirs(os.path.join(final_folder_path, "data", "ephemeris"), exist_ok=True)
 
 # B. Move the Executable
@@ -96,7 +93,6 @@ src_exe = os.path.join(dist_root, binary_name)
 dst_exe = os.path.join(final_folder_path, binary_name)
 
 if binary_collision_path is not None:
-    # Linux/macOS: binary was moved aside above so we could create the folder.
     os.rename(binary_collision_path, dst_exe)
     print(f"[Move] Moved binary to {dst_exe}")
 elif os.path.exists(src_exe):
@@ -105,9 +101,15 @@ elif os.path.exists(src_exe):
 else:
     print(f"[Error] Could not find build artifact: {src_exe}")
 
-# C. Copy Config
+# C. Copy Config & Optional Custom Regions
 if os.path.exists("config.yaml"):
     shutil.copy("config.yaml", os.path.join(final_folder_path, "config.yaml"))
+
+if os.path.exists(os.path.join("data", "regions.json")):
+    shutil.copy(
+        os.path.join("data", "regions.json"),
+        os.path.join(final_folder_path, "data", "regions.json"),
+    )
 
 # D. Copy External Tools if they exist (Optional legacy fallback)
 src_tools = "external_tools"
@@ -126,40 +128,43 @@ readme_path = os.path.join(final_folder_path, "README.txt")
 with open(readme_path, "w", encoding="utf-8") as f:
     f.write(f"VesperFlow v{VERSION}\n")
     f.write("===============================================================\n")
-    f.write("A pipeline for decoding IMU, Audio, and GPS data from Vesper Tags.\n\n")
+    f.write("A cross-platform tool for decoding IMU, Audio, and GPS data from Vesper Tags.\n\n")
 
     f.write("[ QUICK START ]\n")
-    f.write("1. Copy your raw session folders into the input folder configured in config.yaml.\n")
+    f.write("1. Copy your raw session folders into 'data/raw/' (or the path in config.yaml).\n")
     f.write("   The tool scans recursively, so subfolders inside session folders\n")
     f.write("   are handled automatically. Example structure:\n")
     f.write("     data/raw/\n")
     f.write("       20250929_tag1/\n")
-    f.write("         imu/\n")
-    f.write("           0M.BIN, 1M.BIN, ...\n")
-    f.write("         aud/\n")
-    f.write("           0U.BIN, 1U.BIN, ...\n")
-    f.write("         gps/\n")
-    f.write("           0G.BIN, 1G.BIN, ...\n\n")
-    f.write("2. Double-click the executable file.\n")
-    f.write("3. Wait for the process to finish (check the window for progress).\n")
-    f.write("4. Find your results in the processed output folder.\n\n")
+    f.write("         imu/  -> 0M.BIN, 1M.BIN, ...\n")
+    f.write("         aud/  -> 0U.BIN, 1U.BIN, ...\n")
+    f.write("         gps/  -> 0G.BIN, 1G.BIN, ...\n\n")
+    f.write("2. Run the VesperFlow executable.\n")
+    f.write("3. Use the Interactive Pre-Flight Menu to verify paths, select your GPS\n")
+    f.write("   deployment region, customize the report, or toggle Quick Test limits.\n")
+    f.write("   (Tip: Pass '--headless' or set 'interactive_menu: false' in config.yaml\n")
+    f.write("   to skip the menu on headless servers or batch jobs).\n")
+    f.write("4. Select 'Start Processing Pipeline' and find your results in 'data/processed/'.\n\n")
 
     f.write("[ OUTPUTS ]\n")
-    f.write("- IMU:  Converted to .CSV with precise per-packet timestamps.\n")
-    f.write("        On tags with extended configuration, also includes\n")
-    f.write("        Temperature (C) and Barometric Pressure (hPa) columns.\n")
-    f.write("- AUD:  Converted to .WAV (48kHz, metadata artifacts removed).\n")
-    f.write("- GPS:  Converted to .DAT snapshots and decoded to .CSV coordinates.\n\n")
+    f.write("- IMU:    Converted to .CSV with precise per-packet timestamps, NaN glitch\n")
+    f.write("          masking, and optional Temperature (C) / Barometric Pressure (hPa).\n")
+    f.write("- AUD:    Converted to .WAV (48kHz, 64KB page-boundary artifacts removed).\n")
+    f.write("- GPS:    Converted to .DAT snapshots, solved to .CSV coordinates, and logged\n")
+    f.write("          with per-snapshot diagnostics (Track-sdr-diagnostics.csv).\n")
+    f.write("- REPORT: Saved to 'data/processed/report_cards/' (supports compact, verbose,\n")
+    f.write("          and custom component modes).\n\n")
 
     f.write("[ GPS DECODING — NATIVE SDR SOLVER ]\n")
     f.write("VesperFlow includes a built-in, cross-platform GPS SDR Solver (gps_solver: 'sdr').\n")
     f.write("- Internet Connection: On the first run for a new deployment date, VesperFlow\n")
     f.write("  automatically downloads and caches daily NASA/IGS broadcast satellite orbits\n")
     f.write("  into 'data/ephemeris/'. Subsequent runs work completely offline.\n")
-    f.write("- Deployment Region: You can speed up satellite initialization by setting\n")
-    f.write("  'gps_region' in config.yaml (e.g., 'europe', 'germany', 'panama', 'global').\n")
+    f.write("- Deployment Region: Set 'gps_region' in the startup menu or config.yaml\n")
+    f.write("  (e.g., 'europe', 'germany', 'madagascar', 'affenwald'), or add custom study\n")
+    f.write("  bounding boxes via the menu (saved to 'data/regions.json').\n")
     f.write("- Legacy GeoTag Mode: To use the legacy Windows GeoTag.exe instead, set\n")
-    f.write("  gps_solver: 'geotag' in config.yaml and place GeoTag.exe inside external_tools/CG/.\n\n")
+    f.write("  gps_solver: 'geotag' and place GeoTag.exe inside external_tools/CG/.\n\n")
 
     f.write("[ TROUBLESHOOTING ]\n")
     f.write("- If the window closes immediately, check the 'logs' folder.\n")
@@ -172,16 +177,13 @@ with open(readme_path, "w", encoding="utf-8") as f:
     f.write("[ HOW TO PROCESS THE NEXT BATCH ] (Session 2, 3, etc.)\n")
     f.write("* CLEAN UP FIRST:\n")
     f.write(
-        "  Before starting a new batch, please delete the old files from your raw input folder\n"
+        "  Before starting a new batch, move your old raw files out of 'data/raw/'\n"
     )
     f.write(
-        "  and move your results out of the processed folder (save them to permanent storage).\n\n"
+        "  and move your results out of 'data/processed/' to permanent storage.\n\n"
     )
     f.write("  [WHY?] The tool processes EVERYTHING inside the input folder. If you\n")
     f.write("  leave old files there, it will re-scan and re-process them.\n\n")
-
-    f.write("* RESTART:\n")
-    f.write("  Just run the executable again.\n\n")
 
     f.write("===============================================================\n")
     f.write("LEGAL NOTICE:\n")
@@ -191,7 +193,7 @@ with open(readme_path, "w", encoding="utf-8") as f:
     f.write("authorized, or endorsed by A.S.D. (Alexander Schwartz Developments).\n")
     f.write("Vesper is a registered trademark of A.S.D.\n")
 
-print(f"\n[OK] Build Complete!")
+print("\n[OK] Build Complete!")
 if current_os == "Windows":
     print(f"Go to the 'dist' folder and ZIP the '{FOLDER_NAME}' folder.")
 else:
