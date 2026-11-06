@@ -1,6 +1,6 @@
 # Global Constants
 PROJECT_NAME = "VesperFlow"
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 BUILD_TYPE = ""  # Leave empty for stable/release versions. Use "Beta" or "Alpha" for testing.
 
 # Derived Constants

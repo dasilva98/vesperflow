@@ -11,27 +11,18 @@ from src.core.run_reporter import DEFAULT_REPORT_COMPONENTS
 
 CUSTOM_REGIONS_FILE = "./data/regions.json"
 
-# MENU_STYLE = Style([
-#     ("qmark",       "fg:#feb854 bold"),     # Yellow/Orange
-#     ("question",    "bold"),                # Default terminal fg
-#     ("answer",      "fg:#64a4a4 bold"),     # Mint Green
-#     ("pointer",     "fg:#fe626e bold"),     # Mint Green
-#     ("highlighted", "fg:#64a4a4 bold"),     # Mint Green
-#     ("selected",    "fg:#64a4a4"),          # Mint Green
-#     ("separator",   "fg:#707070"),          # Dark Grey
-#     ("instruction", "fg:#c8c8c8 italic"),   # Light Grey
-# ])
 
 MENU_STYLE = Style([
-    ("qmark",       "fg:#feb854 bold"),     # Yellow-Orange
+    ("qmark",       "fg:#feb854 bold"),     # Pastel Orange
     ("question",    "fg:#ffffff bold"),     # White
-    ("answer",      "fg:#e03c32 bold"),     # Teal
-    ("pointer",     "fg:#fe626e bold"),     # Peach
-    ("highlighted", "fg:#64a4a4 bold"),     # Blue
+    ("answer",      "fg:#e03c32 bold"),     # Bright Red
+    ("pointer",     "fg:#fe626e bold"),     # Watermelon Pink
+    ("highlighted", "fg:#64a4a4 bold"),     # Teal
     ("selected",    "fg:#64a4a4"),          # Teal
     ("separator",   "fg:#64a4a4"),          # Teal
-    ("instruction", "fg:#8a6042 italic"),   # Yellow-Orange
+    ("instruction", "fg:#8a6042 italic"),   # Brown
 ])
+
 
 COMPONENT_LABELS = {
     "raw_stats": "Raw Data Statistics (File counts & success % per sensor)",
@@ -44,8 +35,9 @@ COMPONENT_LABELS = {
 }
 
 
-def load_custom_regions(filepath: str = CUSTOM_REGIONS_FILE) -> dict:
+def load_custom_regions(filepath: str = None) -> dict:
     """Loads user-defined region bounding boxes from JSON."""
+    filepath = filepath or CUSTOM_REGIONS_FILE
     if not os.path.exists(filepath):
         return {}
     try:
@@ -60,8 +52,9 @@ def load_custom_regions(filepath: str = CUSTOM_REGIONS_FILE) -> dict:
         return {}
 
 
-def save_custom_regions(regions: dict, filepath: str = CUSTOM_REGIONS_FILE):
+def save_custom_regions(regions: dict, filepath: str = None):
     """Persists user-defined regions to JSON."""
+    filepath = filepath or CUSTOM_REGIONS_FILE
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     serializable = {k: list(v) for k, v in regions.items()}
     with open(filepath, "w", encoding="utf-8") as f:
@@ -78,47 +71,52 @@ def get_all_regions() -> dict:
 def save_config_yaml(config: dict, config_path: str = "config.yaml"):
     """
     Saves persistent user settings back to config.yaml using only the standard library.
-    Preserves all original # comments, blank lines, and structure via regex.
+    Preserves all original # comments, inline comment alignment, blank lines, and structure.
     """
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
     except FileNotFoundError:
-        return  # If no file exists, we simply don't save.
+        return
 
     def format_val(v):
-        """Formats Python types back into YAML-friendly strings."""
         if isinstance(v, bool):
             return str(v).lower()
         if isinstance(v, str):
-            # Add quotes around strings to be safe (e.g., "europe")
             return f'"{v}"'
         return str(v)
 
-    # Walk through the file line-by-line and update matching keys
     for i, line in enumerate(lines):
-        # 1. Match top-level keys (e.g., 'gps_region: "europe"')
-        top_match = re.match(r"^([a-zA-Z0-9_]+)\s*:\s*(.*)", line)
+        # 1. Match top-level keys (captures key, ': ', value, and trailing whitespace/comment)
+        top_match = re.match(
+            r"^([a-zA-Z0-9_]+)(\s*:\s*)([^#\r\n]+?)(\s*(?:#.*)?\r?\n?)$", line
+        )
         if top_match:
-            key = top_match.group(1)
-            # We skip 'report_components' here because it's a nested block
-            if key in config and key != "report_components" and key not in ("AUD_TEST_LIMIT", "GPS_TEST_LIMIT"):
-                # Preserve inline comments if they exist
-                parts = line.split("#", 1)
-                comment = f" #{parts[1]}" if len(parts) > 1 else "\n"
-                lines[i] = f"{key}: {format_val(config[key])}{comment}"
+            key, sep, _, trailing = top_match.groups()
+            if (
+                key in config
+                and key != "report_components"
+                and key not in ("AUD_TEST_LIMIT", "GPS_TEST_LIMIT")
+            ):
+                if not trailing.endswith("\n"):
+                    trailing += "\n"
+                lines[i] = f"{key}{sep}{format_val(config[key])}{trailing}"
                 continue
 
-        # 2. Match nested keys (e.g., '  gps_analytics: true' under report_components)
-        nested_match = re.match(r"^\s+([a-zA-Z0-9_]+)\s*:\s*(.*)", line)
-        if nested_match and "report_components" in config:
-            sub_key = nested_match.group(1)
+        # 2. Match nested keys under report_components
+        nested_match = re.match(
+            r"^(\s+[a-zA-Z0-9_]+)(\s*:\s*)([^#\r\n]+?)(\s*(?:#.*)?\r?\n?)$", line
+        )
+        if nested_match and isinstance(config.get("report_components"), dict):
+            indented_key, sep, _, trailing = nested_match.groups()
+            sub_key = indented_key.strip()
             if sub_key in config["report_components"]:
-                parts = line.split("#", 1)
-                comment = f" #{parts[1]}" if len(parts) > 1 else "\n"
-                lines[i] = f"  {sub_key}: {format_val(config['report_components'][sub_key])}{comment}"
+                if not trailing.endswith("\n"):
+                    trailing += "\n"
+                lines[i] = (
+                    f"{indented_key}{sep}{format_val(config['report_components'][sub_key])}{trailing}"
+                )
 
-    # Write the exact lines back to the file
     with open(config_path, "w", encoding="utf-8") as f:
         f.writelines(lines)
 
@@ -550,14 +548,18 @@ def run_startup_menu(config: dict, config_path: str = "config.yaml") -> dict:
                 default_cfg = {
                     "raw_data_folder": "./data/raw",
                     "processed_folder": "./data/processed",
-                    "gps_engine": "native",
-                    "gps_word_swap": True,
-                    "gps_export_snapshots": True,
-                    "gps_region": "europe",
+                    "ephemeris_folder": "./data/ephemeris",
+                    "interactive_menu": True,
+                    "log_level": "INFO",
                     "report_mode": "verbose",
                     "report_components": dict(DEFAULT_REPORT_COMPONENTS),
-                    "interactive_menu": True
+                    "gps_solver": "sdr",
+                    "gps_region": "europe",
+                    "gps_cli_path": "./external_tools/CG/GeoTag/GeoTag.exe",
+                    "gps_engine_path": "./external_tools/CG/GeoTagEngine/GeoTagEngine.exe",
                 }
+
+
                 config.clear()
                 config.update(default_cfg)
                 save_config_yaml(config, config_path)

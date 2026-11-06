@@ -41,7 +41,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller pytest
+          pip install pyinstaller pytest questionary prompt_toolkit
 
       - name: Run unit test suite
         run: pytest -v
