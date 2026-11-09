@@ -6,7 +6,7 @@
 
 [Tool Demo Video](https://youtu.be/wNGPoCBlQts)
 
-A headless, scriptable CLI automation pipeline for decoding and processing multi-modal time-series data from bio-logging tags. 
+An interactive and headless-ready CLI automation pipeline for decoding and processing multi-modal time-series data from bio-logging tags.
 
 Designed specifically for machine learning and database ingestion workflows, this tool provides a "One-Click" solution to convert raw binary dumps into analysis-ready formats. By bypassing intermediate disk writes in favor of vectorized in-memory array operations, it natively handles proprietary binary decoding, true-time synchronization, software-defined radio (SDR) satellite positioning, and hardware artifact mitigation.
 
@@ -16,11 +16,17 @@ Key Features
 -----------------------
 Vesper tags write raw data using a **128-byte File Header** and **16-byte Block Header** layout with several undocumented hardware quirks. VesperFlow unpacks these streams in memory and cleans up the artifacts before writing analysis-ready files:
 
+### Interactive Pre-Flight Menu & Headless Server Mode
+- **Interactive Terminal Dashboard:** Launches a flicker-free pre-flight menu (`questionary`) to verify input/output paths, toggle quick-test file limits vs. full production runs, switch GPS engines, and customize report outputs on the fly.
+- **Custom GPS Region Manager:** Add, edit, or delete custom study-site bounding boxes directly from the terminal (persisted in `./data/regions.json`), complete with coordinate validation and a Factory Reset safeguard.
+- **Comment-Preserving Config Saver & Factory Reset:** Save modified settings back to `config.yaml` in place without stripping comments or formatting, or restore original defaults via a confirmation-gated Factory Reset.
+- **Automatic Headless Bypass (HPC / Docker / SLURM):** Automatically skips the interactive UI when running in non-TTY batch environments, when `interactive_menu: false` is set in `config.yaml`, or when invoked with `--headless`, `--no-menu`, or `-y`.
+
 ### Sensor Processing & Hardware Fixes
 
 #### IMU (Accelerometer, Gyroscope & Magnetometer)
 - Reconstructs per-packet timestamps directly from the hardware's 1024-tick sub-second counter using vectorized NumPy operations.
-- Masks the reproducible `-8.75` mdps gyroscope glitch at file boundaries with `NaN` so hardware file-split spikes don't corrupt downstream ML classifiers.
+- Masks the reproducible `-8.75` mdps gyroscope glitch at file boundaries with `NaN` (and drops duplicate startup packets) so hardware file-split spikes don't corrupt downstream ML classifiers.
 - Reads the header bitmask to automatically include **Temperature (°C)** and **Barometric Pressure (hPa)** columns when extended sensors are enabled.
 
 #### Audio (Microphone)
@@ -34,18 +40,18 @@ Vesper tags write raw data using a **128-byte File Header** and **16-byte Block 
 - Runs an ephemeris-aided second pass that predicts Doppler and code phase from initial locks to pull weaker canopy satellites out of the noise floor.
 - Solves 5-state coarse-time positions (Lat, Lon, Alt, receiver clock bias, and tag timestamp error) using Weighted Least-Squares with WGS-84 ellipsoid height anchoring, Klobuchar L1 ionospheric corrections, subset outlier rejection, and a second-pass session clock model.
 
-
-### Session Inventory & Diagnostics
-`RunReporter` merges 256-file hardware chunks into continuous tag deployments, outputs standardized filenames (`YYYYMMDD_HHMMSS-YYYYMMDD_HHMMSS_DEVICEID.ext`), and writes a summary `.txt` report card for each run:
-- Calculates true recording duration from sample counts (`N_samples / f_s`) rather than wall-clock start/end times, avoiding skew from scheduled sleep cycles.
-- Flags valid headers with empty payloads as **WARNING** (Empty) rather than **FAIL**, separating normal battery exhaustion from real file corruption.
-- Exports `Track-sdr-diagnostics.csv` alongside the main GPS track to log locked PRNs, C/N0, pseudorange residuals, and rejection reasons for every snapshot.
-
+### Scientific Analytics & Customizable Report Cards
+`RunReporter` merges 256-file hardware chunks into continuous tag deployments, outputs standardized filenames (`YYYYMMDD_HHMMSS-YYYYMMDD_HHMMSS_DEVICEID.ext`), and generates a `.txt` report card configurable in **`compact`**, **`verbose`**, or **`custom`** (per-section toggle) modes:
+- **True Sample-Derived Data Yield:** Calculates true recording duration from sample counts (`N_samples / f_s`) rather than wall-clock start/end times, avoiding skew from scheduled sleep cycles.
+- **GPS / GNSS Signal & Trajectory Analytics:** Reports fix yield %, 3D ($\ge 5$ SVs) vs. 2D ($4$ SVs) fix splits, mean $C/N_0$ (dB-Hz), median HDOP, median pseudorange RMS error (m), median altitude (m), and RTC clock offset (s).
+- **IMU & Environmental Health Analytics:** Computes active sleep-gap-free effective sampling rate (Hz), ambient temperature and barometric pressure ranges, and counts of masked gyroscope glitches and dropped startup duplicates.
+- **Audio Bioacoustics & Signal Integrity:** Detects continuous recording bouts across sleep gaps ($>5$ min), calculates mean file duration, mean RMS and peak acoustic levels (dBFS), digital rail clipping percentage ($|\text{sample}| \ge 32,760$), and flags silent "dead-mic" files ($<-75$ dBFS).
+- **Quality Control & Diagnostics:** Separates empty header-only files (**WARNING**) from corrupted payloads (**CRITICAL FAIL**), and exports `Track-sdr-diagnostics.csv` logging locked PRNs, $C/N_0$, residuals, and rejection reasons for every GPS snapshot.
 
 ### Cross-Platform GPS Modes (`sdr` vs. `geotag`)
 - **Native SDR Mode (`gps_solver: "sdr"`):** Decodes GPS snapshots natively on Linux, macOS, and Windows across all CPU cores without external `.exe` dependencies.
 - **Automatic Orbit Caching:** Downloads daily NASA/IGS broadcast RINEX v3 navigation files (`BRDC`) into `./data/ephemeris/` on the first run for a deployment date and runs offline thereafter.
-- **Regional Search Priors:** Supports continent, country, or field-site presets (`europe`, `germany`, `madagascar`, `affenwald`, etc.) in `config.yaml`, and narrows the search box around the animal after the first solid fix.
+- **Regional Search Priors:** Supports built-in continent, country, or field-site presets (`europe`, `germany`, `madagascar`, `affenwald`, etc.) plus user-defined bounding boxes in `./data/regions.json`.
 - **Legacy GeoTag Mode (`gps_solver: "geotag"`):** Optional Windows wrapper for `GeoTag.exe` / `GeoTagEngine.exe` if you want to cross-check against manufacturer outputs.
 
 
@@ -53,15 +59,10 @@ Build & Quick Start
 -----------------------
 
 ### 1. Prerequisites
-
 - **Python 3.12+**
-
 - **Full Cross-Platform Support:** IMU, Audio, and GPS decoding run natively on **Windows, Linux, and macOS**.
-
 - **Internet Connection (First GPS Run Only):** Required once per deployment date to automatically fetch daily IGS/NASA satellite broadcast ephemerides (~300 KB, cached locally in `./data/ephemeris/`).
-
 - **Legacy GeoTag Mode (Optional):** Only required if `gps_solver` is explicitly set to `"geotag"` in `config.yaml` (requires Windows 10/11 and placing `GeoTag.exe` / `GeoTagEngine.exe` in `external_tools/CG/`).
-
 
 ### 2. Installation
 
@@ -87,32 +88,41 @@ Install dependencies:
 
 ### 3. Configuration
 
-1. Open `config.yaml`.
-2. Update `raw_data_folder` (e.g., `./data/raw`) and `processed_folder` (e.g., `./data/processed`).
+You can configure VesperFlow interactively at startup or by editing `config.yaml`:
+1. Set preferred location for `raw_data_folder` (e.g., `./data/raw`) and `processed_folder` (e.g., `./data/processed`).
+2. Set `report_mode` to `"verbose"` (all 7 tables, default option), `"compact"` (summary only), or `"custom"` (individual toggles under `report_components`).
 3. Configure the GPS solver settings:
    - `gps_solver: "sdr"` (default native cross-platform solver) or `"geotag"` (legacy Windows wrapper).
-   - `gps_region: "europe"` (or `"global"`, `"germany"`, `"panama"`, `"madagascar"`, `"new_zealand"`, etc.) to bound the 
-   initial coarse Doppler search.
+   - `gps_region: "europe"` (or any preset / custom region from `./data/regions.json`).
    - `ephemeris_folder: "./data/ephemeris"` for local RINEX orbit caching.
 
-### 4. Running the Tool
+### 4. Running the Tool & Tests
 
-To run the main processing pipeline:
+Launch with the interactive Pre-Flight Configuration Menu:
 
     python -m src.main
 
-To inspect satellite locks, C/N0, Doppler shifts, and WLS pseudorange residuals on a single `.dat` snapshot:
+Run in headless mode (for Docker, SLURM, or automated server pipelines):
+
+    python -m src.main --headless
+
+Inspect satellite locks, $C/N_0$, Doppler shifts, and WLS pseudorange residuals on a single `.dat` snapshot:
 
     python -m src.tools.gps_inspector <path/to/snap.YYYY_MM_DD_HH_MM_SS_GC0.dat>
+
+Run the offline automated unit test suite (63 tests):
+
+    pytest -v
 
 
 Project Structure
 --------------------
 
     vesperflow/
-    ├── config.yaml ---------------> # Global settings, paths, and GPS solver region priors
+    ├── config.yaml ---------------> # Global settings, report toggles & GPS solver priors
     ├── requirements.txt ----------> # Python dependencies
     ├── build_app.py --------------> # PyInstaller script for standalone builds
+    ├── tests/ --------------------> # 63 offline pytest unit & edge-case tests
     ├── external_tools/ -----------> # (Optional) Place legacy GeoTag tools here (Ignored by Git)
     │   └── CG/
     │       ├── GeoTag/ -----------> # GeoTag.exe and its sidecar files (Optional)
@@ -120,19 +130,25 @@ Project Structure
     ├── data/ ---------------------> # Local data directory (Ignored by Git)
     │   ├── raw/ ------------------> # Input raw session folders (Binary files)
     │   ├── processed/ ------------> # Final database-ready flat outputs (.csv, .wav, reports)
-    │   └── ephemeris/ ------------> # Cached daily IGS/NASA RINEX broadcast orbit files
+    │   ├── ephemeris/ ------------> # Cached daily IGS/NASA RINEX broadcast orbit files
+    │   └── regions.json ----------> # User-defined custom GPS bounding boxes
     └── src/
-        ├── main.py ---------------> # Pipeline orchestrator & CLI dashboard
+        ├── main.py ---------------> # Top-level pipeline orchestrator
         ├── core/ -----------------> # Core Application Logic
-        │   ├── file_scanner.py ---> # Crawls raw data & flattens session chunks
+        │   ├── menu.py -----------> # Interactive Questionary TUI, region manager & config saver
+        │   ├── file_scanner.py ---> # Crawls raw data & flattens 256-file session chunks
         │   ├── export_manager.py -> # Chunked csv/wav exporter & deterministic I/O naming
-        │   ├── run_reporter.py ---> # Generates true yield statistics & report cards
+        │   ├── run_reporter.py ---> # Generates true yield statistics & custom report cards
         │   ├── binary_decoder.py -> # Centralized 128-byte/16-byte metadata decoder
         │   ├── logger.py ---------> # Tqdm logging & AnimatedTqdm spinner
         │   └── constants.py ------> # Versioning & geographic REGION_PRESETS
+        ├── stages/ ---------------> # Modular Sensor Processing Stages
+        │   ├── stage_imu.py ------> # IMU session orchestration, yield & health analytics
+        │   ├── stage_audio.py ----> # Audio session orchestration, bouts & dBFS analytics
+        │   └── stage_gps.py ------> # GPS snapshot extraction, dynamic folder rename & solver routing
         ├── parsers/ --------------> # Native Python Vectorized Decoders
-        │   ├── imu_parser.py -----> # Decodes IMU
-        │   ├── audio_parser.py ---> # Decodes PCM Audio
+        │   ├── imu_parser.py -----> # Decodes IMU packets, 1024-tick clock & NaN glitch filter
+        │   ├── audio_parser.py ---> # Decodes PCM Audio, 64KB sync strip & startup pop mute
         │   └── gps_parser.py -----> # Extracts GPS snapshots, I/Q word swap & sub-second log
         ├── sdr/ ------------------> # Native Cross-Platform GNSS SDR & Navigation Engine
         │   ├── frontend.py -------> # 1.024 MHz 1-bit Complex I/Q unpacker & DC blocker
@@ -151,13 +167,9 @@ We follow Conventional Commits.
 <summary><strong> Please format commit messages as follows: </strong></summary>
 
 - `Feat`: Add native Audio parser
-
 - `Fix`: Resolve 64KB block clicking noise
-
 - `Docs`: Update tools usage
-
 - `Refactor`: Optimize file crawler
-
 
 **Important:** Do not commit raw data files (.BIN, .DAT).
 </details>
