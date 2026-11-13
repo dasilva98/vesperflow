@@ -18,9 +18,9 @@ jobs:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+          fail-fast: false
+          matrix:
+            os: [windows-latest, ubuntu-22.04, macos-latest]
 
     steps:
       # -----------------------------------------------------------------
