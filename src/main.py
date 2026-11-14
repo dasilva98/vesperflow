@@ -149,13 +149,24 @@ def main():
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
+
+    # Check for headless CLI flags to avoid hanging batch jobs
+    cli_flags = set(sys.argv[1:])
+    is_headless = bool(
+        "--headless" in cli_flags or "--no-menu" in cli_flags or "-y" in cli_flags
+        or not sys.stdin.isatty()
+    )
     try:
         main()
-        input("Press Enter to exit...")
+        if not is_headless:
+            input("Press Enter to exit...")
     except Exception as e:
         critic_err_message = "[CRITICAL ERROR] Something went wrong!"
         print("\n\n" + "!" * 100)
         print(f"{critic_err_message:^100}")
         print("!" * 100 + "\n")
         traceback.print_exc()
-        input("[!] Press Enter to exit...")
+        if not is_headless:
+            input("[!] Press Enter to exit...")
+        else:
+            sys.exit(1)
