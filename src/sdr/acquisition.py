@@ -9,6 +9,10 @@ BIT_MS = 20  # GPS navigation data bit duration (20 ms)
 USE_BIT_SYNC_20MS = True
 USE_CODE_PHASE_AIDING = True
 
+# Pre-computed constant 1ms frequency & time grids
+_FREQ_K = np.fft.fftfreq(N_MS, d=1.0 / N_MS)
+_T_1MS = np.arange(N_MS, dtype=np.float64) / FS
+
 
 def generate_native_prns(fs: float = FS) -> dict:
     """Generates GPS L1 C/A FFT replicas sampled at 1.024 MHz."""
@@ -105,20 +109,23 @@ def refine_satellite_bit_sync(
     """
     Refines a detected satellite's Doppler, code phase, and C/N0 using
     1ms code-Doppler alignment, 20ms bit-edge synchronization, and 8x FFT upsampling.
+    Uses factored outer-product carrier mixing for fast execution.
     """
     K = len(seg) // N_MS
     if K < 2 * BIT_MS:
         return None
 
-    t = np.arange(K * N_MS, dtype=np.float64) / FS
-    freq_k = np.fft.fftfreq(N_MS, d=1.0 / N_MS)
-    ms_times_s = (np.arange(K) + 0.5) * 1e-3
+    ms_idx = np.arange(K, dtype=np.float64)
+    ms_times_s = (ms_idx + 0.5) * 1e-3
 
-    # Mix carrier and remove code-Doppler walk on every 1 ms block
-    w = seg[: K * N_MS] * np.exp(-2j * np.pi * doppler_hz * t).astype(np.complex64)
-    F1 = np.fft.fft(w.reshape(K, N_MS), axis=1)
+    # Factored outer-product carrier wipeoff (480 + 1024 exponentials instead of 491,520)
+    ms_phasor = np.exp(-2j * np.pi * doppler_hz * ms_idx * 1e-3).astype(np.complex64)
+    sub_phasor = np.exp(-2j * np.pi * doppler_hz * _T_1MS).astype(np.complex64)
+    w = seg[: K * N_MS].reshape(K, N_MS) * ms_phasor[:, None] * sub_phasor[None, :]
+
+    F1 = np.fft.fft(w, axis=1)
     shift_samples = (doppler_hz / F_L1) * FS * ms_times_s
-    phase_ramp = np.exp(-2j * np.pi * shift_samples[:, None] * freq_k[None, :] / N_MS).astype(np.complex64)
+    phase_ramp = np.exp(-2j * np.pi * shift_samples[:, None] * _FREQ_K[None, :] / N_MS).astype(np.complex64)
     corr1 = np.fft.ifft((F1 * phase_ramp) * code_f[None, :], axis=1)
 
     cand = (coarse_lag + np.arange(-3, 4)) % N_MS
@@ -145,6 +152,30 @@ def refine_satellite_bit_sync(
     return sub_sample, fine_dop, cn0_20ms
 
 
+def _coherent_fft_aligned(
+    seg_3d: np.ndarray,
+    doppler: float,
+    g_times_s: np.ndarray,
+    c_times_s: np.ndarray,
+    group_mid_s: np.ndarray,
+) -> np.ndarray:
+    """
+    Sums coherently across the coh_ms axis BEFORE the 1024-point FFT using
+    factored carrier phasors (8x fewer FFTs and 330x fewer trig calls).
+    """
+    p_c = np.exp(-2j * np.pi * doppler * c_times_s).astype(np.complex64)
+    p_g = np.exp(-2j * np.pi * doppler * g_times_s).astype(np.complex64)
+    p_k = np.exp(-2j * np.pi * doppler * _T_1MS).astype(np.complex64)
+
+    # Coherent sum over coh_ms in time domain -> shape (G, N_MS)
+    w_sum = np.tensordot(seg_3d, p_c, axes=([1], [0])) * (p_g[:, None] * p_k[None, :])
+    F = np.fft.fft(w_sum, axis=1)
+
+    shift_samples = (doppler / F_L1) * FS * group_mid_s
+    phase_ramp = np.exp(-2j * np.pi * shift_samples[:, None] * _FREQ_K[None, :] / N_MS).astype(np.complex64)
+    return F * phase_ramp
+
+
 def fast_signal_gate(seg: np.ndarray, codes_f: np.ndarray, gate_ms: int = 80, coh_ms: int = 5) -> int:
     """
     Stage 1 Fast Gate: Screens the first 80ms at 200 Hz steps to check if at least
@@ -154,15 +185,19 @@ def fast_signal_gate(seg: np.ndarray, codes_f: np.ndarray, gate_ms: int = 80, co
     if len(seg) < G * coh_ms * N_MS:
         return 0
 
-    sub_seg = seg[: G * coh_ms * N_MS]
-    t = np.arange(G * coh_ms * N_MS, dtype=np.float64) / FS
+    seg_3d = seg[: G * coh_ms * N_MS].reshape(G, coh_ms, N_MS)
+    g_times_s = np.arange(G, dtype=np.float64) * (coh_ms * 1e-3)
+    c_times_s = np.arange(coh_ms, dtype=np.float64) * 1e-3
     doppler_bins = np.arange(-4800, 5000, 200)
     cfar_gate = float(chi2.isf(1e-3 / (N_MS * len(doppler_bins)), 2 * G) / (2 * G))
 
     best_snr = np.zeros(len(codes_f), dtype=np.float64)
     for doppler in doppler_bins:
-        w = sub_seg * np.exp(-2j * np.pi * doppler * t).astype(np.complex64)
-        F = np.fft.fft(w.reshape(G, coh_ms, N_MS), axis=2).sum(axis=1)
+        p_c = np.exp(-2j * np.pi * doppler * c_times_s).astype(np.complex64)
+        p_g = np.exp(-2j * np.pi * doppler * g_times_s).astype(np.complex64)
+        p_k = np.exp(-2j * np.pi * doppler * _T_1MS).astype(np.complex64)
+        w_sum = np.tensordot(seg_3d, p_c, axes=([1], [0])) * (p_g[:, None] * p_k[None, :])
+        F = np.fft.fft(w_sum, axis=1)
         corr = np.fft.ifft(F[None, :, :] * codes_f[:, None, :], axis=2)
         power = np.sum(corr.real ** 2 + corr.imag ** 2, axis=1)
         means = np.mean(power, axis=1)
@@ -197,7 +232,10 @@ def acquire_constellation(
         return [], 0.0
 
     seg = seg[: G * coh_ms * N_MS]
-    t = np.arange(G * coh_ms * N_MS, dtype=np.float64) / FS
+    seg_3d = seg.reshape(G, coh_ms, N_MS)
+    g_times_s = np.arange(G, dtype=np.float64) * (coh_ms * 1e-3)
+    c_times_s = np.arange(coh_ms, dtype=np.float64) * 1e-3
+    group_mid_s = (np.arange(G, dtype=np.float64) * coh_ms + 0.5 * coh_ms) * 1e-3
 
     doppler_step = 50.0
     doppler_bins = np.arange(-5000, 5050, doppler_step)
@@ -211,17 +249,8 @@ def acquire_constellation(
     best_dop_idx = np.zeros(n_prn, dtype=np.int64)
     best_profile = np.zeros((n_prn, N_MS), dtype=np.float64)
 
-    freq_k = np.fft.fftfreq(N_MS, d=1.0 / N_MS)
-    group_times_s = (np.arange(G) * coh_ms + 0.5 * coh_ms) * 1e-3
-
     for d_idx, doppler in enumerate(doppler_bins):
-        w = seg * np.exp(-2j * np.pi * doppler * t).astype(np.complex64)
-        F = np.fft.fft(w.reshape(G, coh_ms, N_MS), axis=2).sum(axis=1)
-
-        shift_samples = (doppler / F_L1) * FS * group_times_s
-        phase_ramp = np.exp(-2j * np.pi * shift_samples[:, None] * freq_k[None, :] / N_MS).astype(np.complex64)
-        F_aligned = F * phase_ramp
-
+        F_aligned = _coherent_fft_aligned(seg_3d, float(doppler), g_times_s, c_times_s, group_mid_s)
         corr = np.fft.ifft(F_aligned[None, :, :] * codes_f[:, None, :], axis=2)
         power = np.sum(corr.real ** 2 + corr.imag ** 2, axis=1)
 
@@ -288,6 +317,7 @@ def acquire_ephemeris_aided(
     Stage 3 (Ephemeris-Aided Acquisition):
     Uses predicted Doppler (and optionally predicted code-phase arrival within
     +/- lag_window samples) to recover weaker visible satellites.
+    Caches aligned FFT spectra across shared Doppler bins for speed.
     """
     locked_prns = {d["prn"] for d in existing_detections}
     candidate_prns = [p for p in visible_sv_dopplers if p not in locked_prns and p in prn_fft_dict]
@@ -300,13 +330,15 @@ def acquire_ephemeris_aided(
         return existing_detections
 
     seg = seg[: G * coh_ms * N_MS]
-    t = np.arange(G * coh_ms * N_MS, dtype=np.float64) / FS
-    freq_k = np.fft.fftfreq(N_MS, d=1.0 / N_MS)
-    group_times_s = (np.arange(G) * coh_ms + 0.5 * coh_ms) * 1e-3
+    seg_3d = seg.reshape(G, coh_ms, N_MS)
+    g_times_s = np.arange(G, dtype=np.float64) * (coh_ms * 1e-3)
+    c_times_s = np.arange(coh_ms, dtype=np.float64) * 1e-3
+    group_mid_s = (np.arange(G, dtype=np.float64) * coh_ms + 0.5 * coh_ms) * 1e-3
 
     doppler_step = 50.0
     n_bins = 13  # +/- 300 Hz window
     aided_detections = list(existing_detections)
+    f_aligned_cache = {}
 
     for prn in candidate_prns:
         center_dop = round(visible_sv_dopplers[prn] / doppler_step) * doppler_step
@@ -327,11 +359,12 @@ def acquire_ephemeris_aided(
         profiles = np.zeros((len(doppler_bins), N_MS), dtype=np.float64)
 
         for d_idx, doppler in enumerate(doppler_bins):
-            w = seg * np.exp(-2j * np.pi * doppler * t).astype(np.complex64)
-            F = np.fft.fft(w.reshape(G, coh_ms, N_MS), axis=2).sum(axis=1)
-            shift_samples = (doppler / F_L1) * FS * group_times_s
-            phase_ramp = np.exp(-2j * np.pi * shift_samples[:, None] * freq_k[None, :] / N_MS).astype(np.complex64)
-            F_aligned = F * phase_ramp
+            dop_key = float(doppler)
+            if dop_key not in f_aligned_cache:
+                f_aligned_cache[dop_key] = _coherent_fft_aligned(
+                    seg_3d, dop_key, g_times_s, c_times_s, group_mid_s
+                )
+            F_aligned = f_aligned_cache[dop_key]
 
             corr = np.fft.ifft(F_aligned * code_f[None, :], axis=1)
             power = np.sum(corr.real ** 2 + corr.imag ** 2, axis=0)
