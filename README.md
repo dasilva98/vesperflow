@@ -36,8 +36,8 @@ Vesper tags write raw data using a **128-byte File Header** and **16-byte Block 
 
 #### GPS (Raw Snapshots & Native SDR Solver)
 - Skips the 1,008-byte warm-up padding in `0G.BIN`, applies the required 32-bit/16-bit I/Q word swaps, and logs sub-second header timestamps (`subseconds.csv`) before unpacking the 1.024 MHz 1-bit complex I/Q stream.
-- Screens snapshots with a fast 80 ms noise gate (skipping indoor or underground recordings in milliseconds) before running a 480 ms code-Doppler compensated FFT search, 20 ms bit-synchronized coherent integration, and 8x FFT sinc peak interpolation.
-- Runs an ephemeris-aided second pass that predicts Doppler and code phase from initial locks to pull weaker canopy satellites out of the noise floor.
+- Screens snapshots with a fast 80 ms noise gate (skipping indoor or underground recordings in milliseconds) before running a 480 ms code-Doppler compensated FFT search (accelerated via 1 kHz spectral rolling), 20 ms bit-synchronized coherent integration, and 8x FFT sinc peak interpolation.
+- Uses an Anchor-Guided Parallel Acquisition, which once an initial 3D fix establishes the tag's position, coarse clock offset, and TCXO frequency bias, worker processes restrict subsequent searches to visible satellites within a narrow Doppler window (with automatic blind fallback) and run an ephemeris-aided second pass to pull weak canopy satellites out of the noise floor.
 - Solves 5-state coarse-time positions (Lat, Lon, Alt, receiver clock bias, and tag timestamp error) using Weighted Least-Squares with WGS-84 ellipsoid height anchoring, Klobuchar L1 ionospheric corrections, subset outlier rejection, and a second-pass session clock model.
 
 ### Scientific Analytics & Customizable Report Cards

@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import numpy as np
 from scipy.stats import chi2
 from src.sdr.frontend import FS, N_MS, unpack_vesper_iq
@@ -14,8 +16,13 @@ _FREQ_K = np.fft.fftfreq(N_MS, d=1.0 / N_MS)
 _T_1MS = np.arange(N_MS, dtype=np.float64) / FS
 
 
+@lru_cache(maxsize=4)
 def generate_native_prns(fs: float = FS) -> dict:
-    """Generates GPS L1 C/A FFT replicas sampled at 1.024 MHz."""
+    """
+    Generates GPS L1 C/A FFT replicas sampled at 1.024 MHz.
+    Cached: the 32 LFSR codes are identical for every session (~0.45 s to build).
+    Callers must treat the returned dict and arrays as read-only.
+    """
     prns = {}
     chip_idx = np.floor(np.arange(N_MS) * (1.023e6 / fs)).astype(np.int64) % 1023
 
@@ -40,7 +47,9 @@ def generate_native_prns(fs: float = FS) -> dict:
             g1 = np.roll(g1, 1); g1[0] = new_g1
             g2 = np.roll(g2, 1); g2[0] = new_g2
 
-        prns[f"G{prn:02d}"] = np.conj(np.fft.fft(code[chip_idx])).astype(np.complex64)
+        replica = np.conj(np.fft.fft(code[chip_idx])).astype(np.complex64)
+        replica.flags.writeable = False
+        prns[f"G{prn:02d}"] = replica
 
     return prns
 
@@ -176,6 +185,20 @@ def _coherent_fft_aligned(
     return F * phase_ramp
 
 
+def _coherent_fft_base(seg_3d, doppler, g_times_s, c_times_s):
+    """Carrier-wiped, coherently summed 1 ms spectra WITHOUT the code-Doppler ramp."""
+    p_c = np.exp(-2j * np.pi * doppler * c_times_s).astype(np.complex64)
+    p_g = np.exp(-2j * np.pi * doppler * g_times_s).astype(np.complex64)
+    p_k = np.exp(-2j * np.pi * doppler * _T_1MS).astype(np.complex64)
+    w_sum = np.tensordot(seg_3d, p_c, axes=([1], [0])) * (p_g[:, None] * p_k[None, :])
+    return np.fft.fft(w_sum, axis=1)
+
+
+def _code_doppler_ramp(doppler, group_mid_s):
+    shift_samples = (doppler / F_L1) * FS * group_mid_s
+    return np.exp(-2j * np.pi * shift_samples[:, None] * _FREQ_K[None, :] / N_MS).astype(np.complex64)
+
+
 def fast_signal_gate(seg: np.ndarray, codes_f: np.ndarray, gate_ms: int = 80, coh_ms: int = 5) -> int:
     """
     Stage 1 Fast Gate: Screens the first 80ms at 200 Hz steps to check if at least
@@ -208,6 +231,67 @@ def fast_signal_gate(seg: np.ndarray, codes_f: np.ndarray, gate_ms: int = 80, co
     return int(np.sum(best_snr >= cfar_gate))
 
 
+def _search_doppler_grid(seg_3d, codes_f, bins_per_prn, g_times_s, c_times_s, group_mid_s):
+    """
+    Non-coherent code/Doppler search core shared by blind and guided acquisition.
+
+    bins_per_prn[i] is the (sorted, 50 Hz-grid) array of Doppler bins to test for PRN i.
+    Each distinct bin is visited once and only the PRNs whose window contains it are
+    correlated, so a blind sweep (all PRNs, all bins) costs the same as before while a
+    guided sweep (~10 PRNs x ~25 bins) touches ~25x fewer PRN/bin cells.
+
+    Carrier wipe-off at f0 + k*1 kHz equals wipe-off at f0 followed by a k-bin spectral
+    roll (1 kHz is exactly one FFT bin at 1024 pts / 1 ms and an integer number of cycles
+    per ms, so the per-ms and per-group phasors are unchanged). Only one forward FFT per
+    distinct sub-kHz offset is therefore needed.
+
+    Returns (snr_lists, best_snr, best_bin_idx, best_profile) where snr_lists[i][j] is the
+    peak/mean metric of PRN i at bins_per_prn[i][j].
+    """
+    n_prn = len(bins_per_prn)
+    G = seg_3d.shape[0]
+
+    bin_to_prns: dict = {}
+    for i, bins in enumerate(bins_per_prn):
+        for j, b in enumerate(bins):
+            bin_to_prns.setdefault(int(b), []).append((i, j))
+
+    snr_lists = [np.zeros(len(b), dtype=np.float64) for b in bins_per_prn]
+    best_snr = np.zeros(n_prn, dtype=np.float64)
+    best_bin_idx = np.zeros(n_prn, dtype=np.int64)
+    best_profile = np.zeros((n_prn, N_MS), dtype=np.float64)
+
+    base_cache: dict = {}
+    for d_int in sorted(bin_to_prns):
+        members = bin_to_prns[d_int]
+        f0 = ((d_int + 500) % 1000) - 500
+        k = (d_int - f0) // 1000
+        if f0 not in base_cache:
+            base_cache[f0] = _coherent_fft_base(seg_3d, float(f0), g_times_s, c_times_s)
+        F_aligned = np.roll(base_cache[f0], -k, axis=1)
+        F_aligned *= _code_doppler_ramp(float(d_int), group_mid_s)
+
+        idx = np.fromiter((m[0] for m in members), dtype=np.int64, count=len(members))
+        codes_sel = codes_f if len(idx) == n_prn else codes_f[idx]
+        prod = F_aligned[None, :, :] * codes_sel[:, None, :]
+        mag = np.abs(np.fft.ifft(prod, axis=2))
+        mag *= mag
+        power = mag.sum(axis=1, dtype=np.float64)
+
+        means = np.mean(power, axis=1)
+        peaks = np.max(power, axis=1)
+        snrs = np.divide(peaks, means, out=np.zeros_like(peaks), where=means > 0)
+
+        for row, (i, j) in enumerate(members):
+            snr_lists[i][j] = snrs[row]
+            if snrs[row] > best_snr[i]:
+                best_snr[i] = snrs[row]
+                best_bin_idx[i] = j
+                best_profile[i] = power[row]
+
+    return snr_lists, best_snr, best_bin_idx, best_profile
+
+
 def acquire_constellation(
     filepath: str,
     prn_fft_dict: dict,
@@ -215,21 +299,45 @@ def acquire_constellation(
     coh_ms: int = 8,
     pfa: float = 2e-3,
     use_fast_gate: bool = True,
+    doppler_centers: dict | None = None,
+    doppler_halfwidth: float = 600.0,
 ):
     """
     Acquires GPS constellation with Code-Doppler walk compensation,
     parabolic interpolation, and optional 20ms Bit-Sync + 8x FFT Sinc refinement.
+
+    Blind mode (doppler_centers=None): all PRNs over -5000..+5000 Hz (original behaviour).
+    Guided mode: only the PRNs in doppler_centers, each within +/- doppler_halfwidth of its
+    predicted Doppler. The CFAR threshold is set per PRN for the number of cells actually
+    searched, and the 80 ms gate is skipped (the guided search is cheaper than the gate).
     """
     seg, actual_ms = unpack_vesper_iq(filepath, total_ms=total_ms)
     G = actual_ms // coh_ms
     if G < 10:
         return [], 999.0
 
-    prn_list = list(prn_fft_dict.keys())
+    doppler_step = 50.0
+    if doppler_centers is None:
+        prn_list = list(prn_fft_dict.keys())
+        full_bins = np.arange(-5000, 5050, doppler_step).astype(np.int64)
+        bins_per_prn = [full_bins] * len(prn_list)
+    else:
+        prn_list = [p for p in doppler_centers if p in prn_fft_dict]
+        if not prn_list:
+            return [], 999.0
+        half = int(round(doppler_halfwidth / doppler_step))
+        offsets = np.arange(-half, half + 1, dtype=np.int64) * int(doppler_step)
+        bins_per_prn = [
+            int(round(doppler_centers[p] / doppler_step)) * int(doppler_step) + offsets
+            for p in prn_list
+        ]
+
     codes_f = np.stack([prn_fft_dict[p] for p in prn_list])
 
-    if use_fast_gate and fast_signal_gate(seg, codes_f) < 2:
-        return [], 0.0
+    if use_fast_gate:
+        all_codes_f = codes_f if doppler_centers is None else np.stack(list(prn_fft_dict.values()))
+        if fast_signal_gate(seg, all_codes_f) < 2:
+            return [], 0.0
 
     seg = seg[: G * coh_ms * N_MS]
     seg_3d = seg.reshape(G, coh_ms, N_MS)
@@ -237,66 +345,55 @@ def acquire_constellation(
     c_times_s = np.arange(coh_ms, dtype=np.float64) * 1e-3
     group_mid_s = (np.arange(G, dtype=np.float64) * coh_ms + 0.5 * coh_ms) * 1e-3
 
-    doppler_step = 50.0
-    doppler_bins = np.arange(-5000, 5050, doppler_step)
-    cells = N_MS * len(doppler_bins)
-    cfar_threshold = float(chi2.isf(pfa / cells, 2 * G) / (2 * G))
+    snr_lists, best_snr, best_bin_idx, best_profile = _search_doppler_grid(
+        seg_3d, codes_f, bins_per_prn, g_times_s, c_times_s, group_mid_s
+    )
 
-    n_prn = len(prn_list)
-    n_dop = len(doppler_bins)
-    snr_grid = np.zeros((n_prn, n_dop), dtype=np.float64)
-    best_snr = np.zeros(n_prn, dtype=np.float64)
-    best_dop_idx = np.zeros(n_prn, dtype=np.int64)
-    best_profile = np.zeros((n_prn, N_MS), dtype=np.float64)
+    thr_cache: dict = {}
 
-    for d_idx, doppler in enumerate(doppler_bins):
-        F_aligned = _coherent_fft_aligned(seg_3d, float(doppler), g_times_s, c_times_s, group_mid_s)
-        corr = np.fft.ifft(F_aligned[None, :, :] * codes_f[:, None, :], axis=2)
-        power = np.sum(corr.real ** 2 + corr.imag ** 2, axis=1)
+    def cfar_for(n_bins: int) -> float:
+        if n_bins not in thr_cache:
+            thr_cache[n_bins] = float(chi2.isf(pfa / (N_MS * n_bins), 2 * G) / (2 * G))
+        return thr_cache[n_bins]
 
-        means = np.mean(power, axis=1)
-        peaks = np.max(power, axis=1)
-        snrs = np.divide(peaks, means, out=np.zeros_like(peaks), where=means > 0)
-        snr_grid[:, d_idx] = snrs
-
-        improved = snrs > best_snr
-        best_snr[improved] = snrs[improved]
-        best_dop_idx[improved] = d_idx
-        best_profile[improved] = power[improved]
+    cfar_threshold = cfar_for(len(bins_per_prn[0]))
 
     detections = []
     for i, prn in enumerate(prn_list):
-        if best_snr[i] >= cfar_threshold:
-            peak_bin = int(np.argmax(best_profile[i]))
-            sub_sample = parabolic_interpolation(best_profile[i], peak_bin)
+        bins = bins_per_prn[i]
+        if best_snr[i] < cfar_for(len(bins)):
+            continue
+        peak_bin = int(np.argmax(best_profile[i]))
+        sub_sample = parabolic_interpolation(best_profile[i], peak_bin)
 
-            d_idx = int(best_dop_idx[i])
-            if 0 < d_idx < n_dop - 1:
-                y_m1, y_0, y_p1 = snr_grid[i, d_idx - 1], snr_grid[i, d_idx], snr_grid[i, d_idx + 1]
-                denom = 2.0 * (2.0 * y_0 - y_m1 - y_p1)
-                delta_d = np.clip((y_p1 - y_m1) / denom, -0.5, 0.5) if denom > 1e-12 else 0.0
-                fine_doppler = float(doppler_bins[d_idx] + delta_d * doppler_step)
-            else:
-                fine_doppler = float(doppler_bins[d_idx])
+        d_idx = int(best_bin_idx[i])
+        snr_grid_i = snr_lists[i]
+        if 0 < d_idx < len(bins) - 1:
+            y_m1, y_0, y_p1 = snr_grid_i[d_idx - 1], snr_grid_i[d_idx], snr_grid_i[d_idx + 1]
+            denom = 2.0 * (2.0 * y_0 - y_m1 - y_p1)
+            delta_d = np.clip((y_p1 - y_m1) / denom, -0.5, 0.5) if denom > 1e-12 else 0.0
+            fine_doppler = float(bins[d_idx] + delta_d * doppler_step)
+        else:
+            fine_doppler = float(bins[d_idx])
 
-            cn0_est = 10.0 * np.log10(max((best_snr[i] - 1.0) / (coh_ms * 1e-3), 1.0))
+        cn0_est = 10.0 * np.log10(max((best_snr[i] - 1.0) / (coh_ms * 1e-3), 1.0))
 
-            # Optional 20ms Bit-Synchronized + 8x FFT Sinc Peak Refinement
-            if USE_BIT_SYNC_20MS:
-                ref = refine_satellite_bit_sync(seg, codes_f[i], fine_doppler, peak_bin)
-                if ref is not None:
-                    sub_sample, fine_doppler, cn0_est = ref
+        # Optional 20ms Bit-Synchronized + 8x FFT Sinc Peak Refinement
+        if USE_BIT_SYNC_20MS:
+            ref = refine_satellite_bit_sync(seg, codes_f[i], fine_doppler, peak_bin)
+            if ref is not None:
+                sub_sample, fine_doppler, cn0_est = ref
 
-            tau_ms = sub_sample / float(N_MS)
-            detections.append({
-                "prn": prn,
-                "metric": float(best_snr[i]),
-                "cn0_dbhz": float(cn0_est),
-                "doppler_hz": fine_doppler,
-                "sample_phase": float(sub_sample),
-                "code_phase_chips": float(tau_ms * 1023.0),
-                "tau_ms": float(tau_ms),
-            })
+        tau_ms = sub_sample / float(N_MS)
+        detections.append({
+            "prn": prn,
+            "metric": float(best_snr[i]),
+            "cn0_dbhz": float(cn0_est),
+            "doppler_hz": fine_doppler,
+            "sample_phase": float(sub_sample),
+            "code_phase_chips": float(tau_ms * 1023.0),
+            "tau_ms": float(tau_ms),
+        })
 
     detections.sort(key=lambda d: d["metric"], reverse=True)
     return detections, cfar_threshold
